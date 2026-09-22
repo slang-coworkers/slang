@@ -8939,6 +8939,145 @@ Expr* SemanticsExprVisitor::visitStaticMemberExpr(StaticMemberExpr* expr)
     return _lookupStaticMember(expr, expr->baseExpression);
 }
 
+// Collect the user-declared, non-generic interfaces visible from `scope` that declare a direct
+// member named `memberName` usable in the access that failed, appending each one once to
+// `outInterfaces`. This powers a best-effort "you may be missing a `where` constraint" suggestion
+// when member lookup fails on a value (or the type) of a generic type parameter: any such interface
+// is a plausible bound the user could add via `where <param> : <interface>`.
+//
+// The candidate set is deliberately narrow so a suggestion is not offered where the constraint
+// would obviously fail to apply (it is still advisory — the note prints the interface's unqualified
+// name and does not prove that name resolves uniquely at the use site):
+//   * Only interfaces written in user code are considered; the core module is skipped as
+//     `findClosestInScopeName` does, since common requirement names appear on many builtin
+//     interfaces and would produce noisy, rarely-relevant suggestions (skipping the core container
+//     also avoids materializing its members).
+//   * Only non-generic interfaces are considered, because a bare `where T : IFoo` names no type
+//     arguments and is rejected for a generic `interface IFoo<...>`, and the arguments cannot be
+//     inferred here.
+//   * The interface must declare a requirement of the name that is usable in the access that
+//     failed and visible from the use site: a static access `T.m` needs a requirement usable as a
+//     static member (`isDeclUsableAsStaticMember`, which unwraps a generic requirement such as
+//     `static T make<U>(U)` that a plain static-modifier check would miss), while a value access
+//     `v.m` accepts either an instance or a static requirement. Suggesting an interface whose
+//     matching requirement is the wrong kind or is inaccessible would only trade one error for
+//     another (E30100 / E30600).
+//   * Only *directly*-declared interface members are matched and the inheritance graph is not
+//     walked, keeping this search off the hot path of successful lookups.
+static void findVisibleInterfacesDeclaringMember(
+    SemanticsVisitor* semantics,
+    Name* memberName,
+    bool isStaticAccess,
+    Scope* scope,
+    List<InterfaceDecl*>& outInterfaces)
+{
+    if (!memberName)
+        return;
+
+    HashSet<InterfaceDecl*> seen;
+    for (Scope* s = scope; s; s = s->parent)
+    {
+        for (Scope* sib = s; sib; sib = sib->nextSibling)
+        {
+            auto containerDecl = sib->containerDecl;
+            if (!containerDecl)
+                continue;
+            if (isFromCoreModule(containerDecl))
+                continue;
+
+            for (auto memberDecl : containerDecl->getDirectMemberDecls())
+            {
+                auto interfaceDecl = as<InterfaceDecl>(memberDecl);
+                if (!interfaceDecl)
+                    continue;
+                if (!semantics->isDeclVisibleFromScope(makeDeclRef(interfaceDecl), scope))
+                    continue;
+
+                bool declaresUsableMember = false;
+                for (auto requirement : interfaceDecl->getDirectMemberDeclsOfName(memberName))
+                {
+                    if (isStaticAccess && !semantics->isDeclUsableAsStaticMember(requirement))
+                        continue;
+                    if (!semantics->isDeclVisibleFromScope(makeDeclRef(requirement), scope))
+                        continue;
+                    declaresUsableMember = true;
+                    break;
+                }
+                if (!declaresUsableMember)
+                    continue;
+
+                if (seen.add(interfaceDecl))
+                    outInterfaces.add(interfaceDecl);
+            }
+        }
+    }
+}
+
+void SemanticsVisitor::maybeSuggestMissingGenericConstraintForMemberLookup(
+    DeclRefExpr* expr,
+    QualType const& baseType)
+{
+    // Recover the generic type parameter the lookup failed on, and whether the access was static.
+    // A value member access `v.m` has `baseType` equal to the value's type; a static access `T.m`
+    // has `baseType` equal to `TypeType(T)`. Both reach here on failure, so a `TypeType` marks the
+    // static case; unwrap it, then require a `DeclRefType` of a `GenericTypeParamDecl` (any other
+    // base is not the case we suggest for).
+    Type* type = baseType.type;
+    bool isStaticAccess = false;
+    if (auto typeType = as<TypeType>(type))
+    {
+        type = typeType->getType();
+        isStaticAccess = true;
+    }
+    auto declRefType = as<DeclRefType>(type);
+    if (!declRefType)
+        return;
+    auto genericParamDeclRef = declRefType->getDeclRef().as<GenericTypeParamDecl>();
+    if (!genericParamDeclRef)
+        return;
+
+    List<InterfaceDecl*> interfaces;
+    findVisibleInterfacesDeclaringMember(
+        this,
+        expr->name,
+        isStaticAccess,
+        m_outerScope,
+        interfaces);
+    if (interfaces.getCount() == 0)
+        return;
+
+    // A suggested `where T : IFoo` names the interface by its unqualified name, so if two distinct
+    // visible interfaces share that name the suggestion would be ambiguous; count occurrences of
+    // each name and drop any that is not unique among the matches.
+    Dictionary<Name*, Index> nameCounts;
+    for (auto interfaceDecl : interfaces)
+    {
+        Index count = 0;
+        nameCounts.tryGetValue(interfaceDecl->getName(), count);
+        nameCounts[interfaceDecl->getName()] = count + 1;
+    }
+
+    // Sort by name so the notes are emitted in a stable order regardless of scope/import walk
+    // order, keeping diagnostic output deterministic.
+    interfaces.sort([](InterfaceDecl* left, InterfaceDecl* right)
+                    { return left->getName()->text < right->getName()->text; });
+
+    auto genericParamName = genericParamDeclRef.getDecl()->getName();
+    for (auto interfaceDecl : interfaces)
+    {
+        Index count = 0;
+        nameCounts.tryGetValue(interfaceDecl->getName(), count);
+        if (count != 1)
+            continue;
+
+        getSink()->diagnose(Diagnostics::SuggestConstraintForMissingMember{
+            .genericParam = genericParamName,
+            .interfaceName = interfaceDecl->getName(),
+            .member = expr->name,
+            .location = expr->loc});
+    }
+}
+
 Expr* SemanticsVisitor::lookupMemberResultFailure(
     DeclRefExpr* expr,
     QualType const& baseType,
@@ -8951,10 +9090,13 @@ Expr* SemanticsVisitor::lookupMemberResultFailure(
     if (!supressDiagnostic)
     {
         if (!maybeDiagnoseAmbiguousReference(GetBaseExpr(expr)))
+        {
             getSink()->diagnose(Diagnostics::NoMemberOfNameInType{
                 .name = expr->name,
                 .type = baseType.type,
                 .expr = expr});
+            maybeSuggestMissingGenericConstraintForMemberLookup(expr, baseType);
+        }
     }
     return expr;
 }

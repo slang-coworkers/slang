@@ -4083,6 +4083,16 @@ public:
         QualType const& baseType,
         bool supressDiagnostic = false);
 
+    /// When member lookup on `expr` fails because its base is a value (or the type) of a generic
+    /// type parameter, emit follow-on notes suggesting user-declared interfaces the parameter
+    /// could be constrained to so that the member becomes available (e.g. `where T : IHasNormal`).
+    /// A no-op unless the base resolves to a `GenericTypeParamDecl` and at least one visible
+    /// interface declares a member of the failed name; it runs only on the lookup-failure path,
+    /// so it adds no cost to successful compiles.
+    void maybeSuggestMissingGenericConstraintForMemberLookup(
+        DeclRefExpr* expr,
+        QualType const& baseType);
+
     SharedSemanticsContext& operator=(const SharedSemanticsContext&) = delete;
 
 
