@@ -56,11 +56,12 @@ are still E33180 in Slang 2025):
   signature;
 - a second dynamic type, for example a method generic parameter that receives
   another existential;
-- conforming types that specialize to one shared type, such as empty
-  specializations of one generic struct, when the method has more than one
-  constraint on `T`. Such conformers leave a single type with several witnesses; with
-  one constraint each witness gets its own copy, but witnesses of two constraints
-  cannot be paired by type.
+- conforming types that share one IR type, when the method has more than one
+  constraint on `T`. `removeUnusedGenericParam` hoists a struct that does not use its
+  generic parameters out of its generic, so empty specializations such as `Number<0>`
+  and `Number<1>` are one type with one witness each. With one constraint each
+  witness gets its own copy, whether or not other conformers have types of their
+  own; the witnesses of two constraints cannot be paired by type.
 
 In Slang 2025 the error for such a method is reported once, at the first call that
 reaches its shared set specialization; other calls of the method with the same set
@@ -103,17 +104,17 @@ values are weak and the per-type copies are made in a later round than the stati
 calls, the pass keeps the intermediate generic `specialize(g, A, wA)` alive until it
 finishes.
 
-Typeflow (`analyzeSpecialize`) supplies the set of types for `T` and a witness set per
-constraint. `specializeGenericWithSetArgs` builds the ordinary signature with one
-leading tag per witness set, then first calls `trySpecializePerConformance`. That
-function requires every other argument to be a single static value, indexes each
-witness set by `getConcreteType()`, and checks that every set covers exactly the
-alternatives of the type set, with one witness per type. When the alternatives
-specialize to one shared type, `T` receives that type itself, and a method with a
-single constraint gets one copy per witness instead. It specializes the generic
-and its type once per alternative through `specializeGeneric` and checks each resulting
-signature against the dispatcher. No witness-entry positions, numeric-tag equality,
-structural equivalence relation, or new substitution algorithm are used.
+Typeflow (`analyzeSpecialize`) supplies the set of types for `T` (or a single type, when
+every conformer shares one) and a witness set per constraint. `specializeGenericWithSetArgs`
+builds the ordinary signature with one leading tag per witness set, then first calls
+`trySpecializePerConformance`. That function requires every other argument to be a single
+static value and checks that the concrete types (`getConcreteType()`) of every witness set
+are exactly the types `T` can receive. Each witness of the first constraint gets one copy;
+the witnesses of further constraints are paired with it by concrete type, which requires one
+witness per type. It specializes the generic and its type once per copy through
+`specializeGeneric` and checks each resulting signature against the dispatcher. No
+witness-entry positions, numeric-tag equality, structural equivalence relation, or new
+substitution algorithm are used.
 
 `createDispatchFunc` accepts the count of leading witness tags (one by default). For
 this caller they all describe the same concrete `T`, so only the first selects a
@@ -145,14 +146,15 @@ existential conversions remain separate work.
   Vulkan and D3D12 results plus HLSL, SPIR-V and DXIL structure checks for per-type
   copies, multiple constraints, fixed results, concrete references, associated
   results, separately compiled conformers, nine conformers, a single conformer,
-  conformers that share one type, ray
-  queries (also generic over the query flags) and methods with their own generic
-  parameters, including calls from another generic function. Slang 2025 variants of
-  several of them compile only if every copy was formed.
+  conformers that share one type (alone and mixed with a conformer of its own type),
+  ray queries (also generic over the query flags) and methods with their own generic
+  parameters, including dynamic and static calls from another generic function. Slang
+  2025 variants of several of them compile only if every copy was formed.
 - `tests/language-feature/dynamic-dispatch/interface-extension-diagnose.slang`: Slang
   2025 accepts the extension method and still rejects an ordinary generic function
   called with the same existential.
 - `tests/diagnostics/specialize-per-conformance-*.slang`: Slang 2025 keeps E33180,
   reported at the call, for results and references whose type depends on `T`, for
   parameter packs, for an existential or interface type passed for the method's own
-  parameter, and for merged conformers; legacy mode compiles the shared body.
+  parameter, and for conformers that share one type with a two-constraint method;
+  legacy mode compiles the shared body.

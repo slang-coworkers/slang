@@ -49,12 +49,13 @@ IRInst* specializeGenericImpl(
     SpecializationContext* context,
     bool queueFollowUpWork);
 
-// Returns true if `arg` is not at module scope, or is a set of possibilities from typeflow.
-// In a function at module scope, which is where callers apply it, such an argument is a runtime
-// value: one extracted from an existential before typeflow, or the sets and tags typeflow
-// replaces it with. (Inside a generic, a local argument can also be one of the generic's own
-// parameters, which callers rule out separately.) A module-scope interface type is static: no
-// per-type copies can replace it, so typeflow checks it as an ordinary existential argument.
+// Returns true if `arg` is not yet a single static value: it is not at module scope, or it is a
+// set of possibilities from typeflow. In a function at module scope such an argument is a runtime
+// value, either one extracted from an existential before typeflow or the sets and tags typeflow
+// replaces it with. Inside a generic it can also be one of the generic's own parameters, which
+// becomes static once the enclosing generic is specialized; flattening inside generic bodies
+// relies on that. A module-scope interface type is static: no per-type copies can replace it, so
+// typeflow checks it as an ordinary existential argument.
 static bool isDynamicSpecializationArg(IRInst* arg)
 {
     return arg->getParent()->getOp() != kIROp_ModuleInst || as<IRSetBase>(arg) ||
@@ -87,9 +88,10 @@ static void diagnoseCannotSpecializeGenericWithExistential(
         .location = location});
 }
 
-// Return whether flattenNestedGeneric can merge `outer` with the generic it returns: `outer`
-// returns a generic, and the type of each inner parameter is either at module scope or one of
-// the parameters of `outer` (so it is available before the merged block's ordinary insts).
+// Return whether flattenNestedGeneric can flatten `outer` and the generic it returns into one
+// generic: `outer` returns a generic, and the type of each inner parameter is either at module
+// scope or one of the parameters of `outer` (so it is available before the flattened generic's
+// ordinary insts).
 static bool canFlattenNestedGeneric(IRGeneric* outer)
 {
     auto inner = as<IRGeneric>(findGenericReturnVal(outer));
@@ -126,8 +128,8 @@ static IRGeneric* flattenNestedGeneric(IRBuilder& builder, IRGeneric* outer)
     builder.setInsertInto(builder.emitBlock());
 
     // Cloning keeps each parameter's decorations and remaps their operands, and the outer
-    // parameters come first, so the copy of `T` keeps SpecializePerConformanceDecoration and the
-    // copies of its witnesses keep a ConstrainedTypeDecoration naming that copy.
+    // parameters come first, so the clone of `T` keeps SpecializePerConformanceDecoration and the
+    // clones of its witnesses keep a ConstrainedTypeDecoration naming that clone.
     IRCloneEnv env;
     for (auto param : outer->getParams())
         cloneInst(&env, &builder, param);
@@ -646,7 +648,7 @@ struct SpecializationContext
             }
         }
 
-        // Every static specialization of a flattened copy passes through here, whichever path
+        // Every static specialization of a flattened generic passes through here, whichever path
         // reaches it (per-type copies, typeflow narrowing a set to one type, on-demand
         // translation), so this is the one place that turns it back into the nested form.
         if (auto origin = genericVal->findDecoration<IRFlattenedGenericDecoration>())
@@ -861,11 +863,11 @@ struct SpecializationContext
         return hasNonTrivialUses;
     }
 
-    // Return the flattened copy of `generic` (see flattenNestedGeneric), creating it when no live
-    // copy exists. Each copy records `generic` in a FlattenedGenericDecoration, which is how any
-    // specialization context finds it again. Return null when `generic` cannot be flattened: its
-    // type is not itself a generic (a type-level generic, whose type is the generic kind), or an
-    // inner parameter's type rules it out (canFlattenNestedGeneric).
+    // Return the flattened form of `generic` (see flattenNestedGeneric), creating it when no
+    // live one exists. Each flattened generic records `generic` in a FlattenedGenericDecoration,
+    // which is how any specialization context finds it again. Return null when `generic` cannot
+    // be flattened: its type is not itself a generic (a type-level generic, whose type is the
+    // generic kind), or an inner parameter's type rules it out (canFlattenNestedGeneric).
     IRGeneric* findOrCreateFlattenedGeneric(IRGeneric* generic)
     {
         for (auto use = generic->firstUse; use; use = use->nextUse)

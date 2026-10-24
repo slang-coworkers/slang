@@ -7020,6 +7020,7 @@ struct TypeFlowSpecializationContext
                         builder.addDecoration(
                             selectedCallee,
                             kIROp_DisallowSpecializationWithExistentialsDecoration);
+                        // A call rebuilt by tryExpandArgPack has no location of its own.
                         if (inst->sourceLoc.isValid())
                             selectedCallee->sourceLoc = inst->sourceLoc;
                         else if (callee->sourceLoc.isValid())

@@ -41,16 +41,17 @@ IRInst* specializeGeneric(IRSpecialize* specInst);
 /// Run local specialization opportunities exposed under an already-materialized IR value.
 bool specializeChildInsts(SpecializationContext* context, IRInst* rootInst);
 
-/// Return the per-conformance type parameter that generic parameter `param` is or constrains:
-/// `param` itself when it is the marked target `T` of `extension<T : I> T`, that `T` when
-/// `param` is a witness for one of its constraints, or null for any other parameter.
+/// Return the per-conformance type parameter that generic parameter `param` refers to: `param`
+/// itself when it is the marked target `T` of `extension<T : I> T`, that `T` when `param` is the
+/// witness for one of its constraints, or null for any other parameter.
 IRParam* findPerConformanceTypeParam(IRParam* param);
 
-/// Return whether `specialize` binds runtime arguments (local values, or sets of possibilities
-/// from type-flow analysis) only to one per-conformance type parameter and the witnesses
-/// constraining it. This tests only the arguments' shape: such a specialization is attempted as
-/// one concrete specialization per type, and still falls back to a shared body when the
-/// method's signature changes with the type.
+/// Return whether `specialize` has at least one argument that is not yet a single static value
+/// (a local value, or a set of possibilities from type-flow analysis), and binds every such
+/// argument to one per-conformance type parameter or the witnesses of its constraints. This is
+/// only a precondition for attempting one copy per type: the shared body is still used when the
+/// method's signature changes with the type, when conformers that share one IR type meet more
+/// than one constraint, or when a witness set is unbounded or empty.
 bool isPerConformanceCandidate(IRSpecialize* specialize);
 
 } // namespace Slang

@@ -2200,8 +2200,9 @@ local insts = {
 			},
 			{
 				SpecializePerConformance = {
-					-- Marks the type parameter `T` that `extension<T : I> T` extends. A set
-					-- of types passed for it is specialized once per concrete type.
+					-- Marks the type parameter `T` that `extension<T : I> T` extends. When a
+					-- method of the extension is specialized with a set of types for it,
+					-- trySpecializePerConformance attempts one copy per concrete type.
 					struct_name = "SpecializePerConformanceDecoration",
 				},
 			},
@@ -2358,9 +2359,9 @@ local insts = {
 			},
 			{
 				FlattenedGenericDecoration = {
-					-- On a generic built by merging a generic with the generic it returns,
-					-- records the original; its leading parameters are clones of the
-					-- original's, in order. The merged form only describes a call with
+					-- On a generic built by flattening a generic and the generic it returns
+					-- into one, records the original; its leading parameters are clones of the
+					-- original's, in order. The flattened form only describes a call with
 					-- runtime arguments: SpecializationContext::specializeGeneric turns a
 					-- specialization with static arguments back into the nested form.
 					operands = { { "originalGeneric" } },
