@@ -26,8 +26,10 @@ struct B : IValue
     [mutating] void increment() { value += 2; }
 }
 
-// Concrete returns and concrete references specialize per type; a mutating method
-// changes the type of its `this` reference and keeps the shared body.
+// This file checks results and the copy-in/copy-out behavior of aliased arguments. By
+// design, the concrete return and the concrete references get per-type copies and the
+// mutating method keeps the shared body (its `this` reference changes type);
+// specialize-per-conformance-not-applied.slang checks the latter in Slang 2025.
 extension<T : IValue> T
 {
     uint returnValue() { return this.get(); }
@@ -71,11 +73,11 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     outputBuffer[offset] = value.returnValue();
     mutateValue(value, result);
     outputBuffer[offset + 1] = result;
-    uint annotated = 1;
+    uint extensionResult = 1;
     uint ordinary = 1;
-    value.aliasState(annotated, annotated);
+    value.aliasState(extensionResult, extensionResult);
     ordinaryAliasState(value, ordinary, ordinary);
-    outputBuffer[offset + 2] = annotated == ordinary ? 1 : 0;
+    outputBuffer[offset + 2] = extensionResult == ordinary ? 1 : 0;
 }
 
 // CHECK: 5

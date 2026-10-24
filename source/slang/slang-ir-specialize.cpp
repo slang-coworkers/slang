@@ -49,9 +49,12 @@ IRInst* specializeGenericImpl(
     SpecializationContext* context,
     bool queueFollowUpWork);
 
-// Returns true if `arg` is a specialization argument that is only known at runtime: a local
-// value such as one extracted from an existential, or a set of possibilities from typeflow.
-// A module-scope interface type is not a runtime argument: no per-type copies can replace it.
+// Returns true if `arg` is not at module scope, or is a set of possibilities from typeflow.
+// In a function at module scope, which is where callers apply it, such an argument is a runtime
+// value: one extracted from an existential before typeflow, or the sets and tags typeflow
+// replaces it with. (Inside a generic, a local argument can also be one of the generic's own
+// parameters, which callers rule out separately.) A module-scope interface type is static: no
+// per-type copies can replace it, so typeflow checks it as an ordinary existential argument.
 static bool isDynamicSpecializationArg(IRInst* arg)
 {
     return arg->getParent()->getOp() != kIROp_ModuleInst || as<IRSetBase>(arg) ||
@@ -85,8 +88,8 @@ static void diagnoseCannotSpecializeGenericWithExistential(
 }
 
 // Return whether flattenNestedGeneric can merge `outer` with the generic it returns: `outer`
-// returns a generic, and the type of each inner parameter depends on nothing but the parameters
-// of `outer`.
+// returns a generic, and the type of each inner parameter is either at module scope or one of
+// the parameters of `outer` (so it is available before the merged block's ordinary insts).
 static bool canFlattenNestedGeneric(IRGeneric* outer)
 {
     auto inner = as<IRGeneric>(findGenericReturnVal(outer));
@@ -122,6 +125,9 @@ static IRGeneric* flattenNestedGeneric(IRBuilder& builder, IRGeneric* outer)
     builder.setInsertInto(flattened);
     builder.setInsertInto(builder.emitBlock());
 
+    // Cloning keeps each parameter's decorations and remaps their operands, and the outer
+    // parameters come first, so the copy of `T` keeps SpecializePerConformanceDecoration and the
+    // copies of its witnesses keep a ConstrainedTypeDecoration naming that copy.
     IRCloneEnv env;
     for (auto param : outer->getParams())
         cloneInst(&env, &builder, param);
@@ -640,6 +646,21 @@ struct SpecializationContext
             }
         }
 
+        // Every static specialization of a flattened copy passes through here, whichever path
+        // reaches it (per-type copies, typeflow narrowing a set to one type, on-demand
+        // translation), so this is the one place that turns it back into the nested form.
+        if (auto origin = genericVal->findDecoration<IRFlattenedGenericDecoration>())
+        {
+            bool hasDynamicArg = false;
+            for (UInt ii = 0; ii < argCount; ++ii)
+                hasDynamicArg |= isDynamicSpecializationArg(specializeInst->getArg(ii));
+            if (!hasDynamicArg)
+                return specializeFlattenedThroughNestedForm(
+                    origin,
+                    specializeInst,
+                    queueFollowUpWork);
+        }
+
         IRBuilder builder(module);
         auto entry =
             builder.fetchCompilerDictionaryEntry(module->getTranslationDict(), specializeInst);
@@ -706,7 +727,7 @@ struct SpecializationContext
 
         // Specializing an extension generic whose method has its own generic parameters yields
         // an intermediate generic. The per-type copies of that method are specialized from it in
-        // a later round (specializeGenericThroughNestedForm), to reuse the functions that static
+        // a later round (specializeFlattenedThroughNestedForm), to reuse the functions that static
         // calls produced. Compiler-dictionary values are weak, so we keep the intermediate alive
         // until this pass finishes.
         if (as<IRGeneric>(specializedVal) && hasPerConformanceTypeParam(genericVal) &&
@@ -840,17 +861,17 @@ struct SpecializationContext
         return hasNonTrivialUses;
     }
 
-    // Return the flattened copy of the nested per-conformance generic `generic` (see
-    // flattenNestedGeneric), creating it when no live copy exists, or null when it cannot be
-    // flattened. The copy records `generic` in a FlattenedGenericDecoration, which is how any
-    // specialization context finds it again.
+    // Return the flattened copy of `generic` (see flattenNestedGeneric), creating it when no live
+    // copy exists. Each copy records `generic` in a FlattenedGenericDecoration, which is how any
+    // specialization context finds it again. Return null when `generic` cannot be flattened: its
+    // type is not itself a generic (a type-level generic, whose type is the generic kind), or an
+    // inner parameter's type rules it out (canFlattenNestedGeneric).
     IRGeneric* findOrCreateFlattenedGeneric(IRGeneric* generic)
     {
         for (auto use = generic->firstUse; use; use = use->nextUse)
         {
             if (auto decoration = as<IRFlattenedGenericDecoration>(use->getUser()))
-                if (auto existing = as<IRGeneric>(decoration->getParent()))
-                    return existing;
+                return cast<IRGeneric>(decoration->getParent());
         }
 
         auto genericType = as<IRGeneric>(generic->getDataType());
@@ -865,51 +886,42 @@ struct SpecializationContext
         return flattened;
     }
 
-    // Return specialize(specialize(g, a...), b...), the nested form that static call sites of
-    // a method use, for specialize(flattened(g), a..., b...); or null when the base of
-    // `flatSpec` is not a flattened copy.
-    IRSpecialize* emitNestedFormOfFlattenedSpecialize(IRBuilder& builder, IRSpecialize* flatSpec)
+    // Specialize `specInst` = specialize(flattened(g), a..., b...), whose arguments are all
+    // static, through the nested form specialize(specialize(g, a...), b...) that lowering emits
+    // for a static call. The result is then the same function a static call of the method
+    // produces, so a method gets one copy per type and one set of `static` variables.
+    IRInst* specializeFlattenedThroughNestedForm(
+        IRFlattenedGenericDecoration* origin,
+        IRSpecialize* specInst,
+        bool queueFollowUpWork)
     {
-        auto origin = flatSpec->getBase()->findDecoration<IRFlattenedGenericDecoration>();
-        if (!origin)
-            return nullptr;
         auto original = cast<IRGeneric>(origin->getOriginalGeneric());
         UInt outerParamCount = 0;
         for ([[maybe_unused]] auto param : original->getParams())
             ++outerParamCount;
         List<IRInst*> outerArgs;
         List<IRInst*> innerArgs;
-        for (UInt i = 0; i < flatSpec->getArgCount(); ++i)
-            (i < outerParamCount ? outerArgs : innerArgs).add(flatSpec->getArg(i));
-        auto outerType =
-            builder.emitSpecializeInst(builder.getTypeKind(), original->getDataType(), outerArgs);
-        auto outerSpec = builder.emitSpecializeInst((IRType*)outerType, original, outerArgs);
-        return cast<IRSpecialize>(
-            builder.emitSpecializeInst(flatSpec->getFullType(), outerSpec, innerArgs));
-    }
+        for (UInt i = 0; i < specInst->getArgCount(); ++i)
+            (i < outerParamCount ? outerArgs : innerArgs).add(specInst->getArg(i));
 
-    // Specialize `specInst`, whose arguments are all static, to the value it denotes. For
-    // specialize(flattened(g), a..., b...) we specialize its nested form instead, so a per-type
-    // copy of a method is the same function that a static call of that method produces.
-    IRInst* specializeGenericThroughNestedForm(IRSpecialize* specInst, UInt specializationDepth)
-    {
+        auto depth = getSpecializationDepth(specInst);
         IRBuilder builder(module);
         builder.setInsertInto(module);
-        auto nested = emitNestedFormOfFlattenedSpecialize(builder, specInst);
-        if (!nested)
-            return Slang::specializeGeneric(this, specInst);
-        auto outerSpec = cast<IRSpecialize>(nested->getBase());
-        addSpecializationDepthDecorationsToClonedSpecializeInsts(outerSpec, specializationDepth);
-        auto innerGeneric = as<IRGeneric>(Slang::specializeGeneric(this, outerSpec));
+        auto outerType =
+            builder.emitSpecializeInst(builder.getTypeKind(), original->getDataType(), outerArgs);
+        auto outerSpec =
+            cast<IRSpecialize>(builder.emitSpecializeInst((IRType*)outerType, original, outerArgs));
+        addSpecializationDepthDecoration(outerSpec, depth);
+        // Null means specializeGeneric already reported a cycle or an exhausted depth budget.
+        auto innerGeneric = specializeGeneric(original, outerSpec, queueFollowUpWork);
         if (!innerGeneric)
             return nullptr;
-        List<IRInst*> innerArgs;
-        for (UInt i = 0; i < nested->getArgCount(); ++i)
-            innerArgs.add(nested->getArg(i));
-        auto innerSpec = cast<IRSpecialize>(
-            builder.emitSpecializeInst(nested->getFullType(), innerGeneric, innerArgs));
-        addSpecializationDepthDecorationsToClonedSpecializeInsts(innerSpec, specializationDepth);
-        return Slang::specializeGeneric(this, innerSpec);
+        auto innerSpec = cast<IRSpecialize>(builder.emitSpecializeInst(
+            specInst->getFullType(),
+            cast<IRGeneric>(innerGeneric),
+            innerArgs));
+        addSpecializationDepthDecoration(innerSpec, depth);
+        return specializeGeneric(cast<IRGeneric>(innerGeneric), innerSpec, queueFollowUpWork);
     }
 
     // Rewrite specialize(specialize(g, a...), b...) into specialize(flattened(g), a..., b...)
@@ -917,22 +929,22 @@ struct SpecializationContext
     // specialization of a set of types handles a generic that returns a function; in the nested
     // shape, the outer generic would instead be evaluated with that set before its inner
     // arguments are known.
+    //
+    // The flattened form only ever describes such a dynamic call: once its arguments are all
+    // static, specializeGeneric evaluates it through the nested form again
+    // (specializeFlattenedThroughNestedForm).
     bool maybeFlattenNestedPerConformanceSpecialize(IRSpecialize* specInst)
     {
         auto outerSpec = as<IRSpecialize>(specInst->getBase());
         if (!outerSpec)
             return false;
-        // Code inside a generic is specialized again before it runs, and a static
-        // specialization keeps the nested form, so only code outside generics is rewritten.
-        if (specInst->getParent()->getOp() != kIROp_ModuleInst)
-        {
-            auto func = getParentFunc(specInst);
-            if (!func || func->getParent()->getOp() != kIROp_ModuleInst)
-                return false;
-        }
+        // Inside a generic, a local argument may be one of the generic's own parameters rather
+        // than a runtime value. Rewriting such a call is harmless: once the enclosing generic is
+        // specialized statically, specializeGeneric evaluates the flattened form through the
+        // nested form again. Typeflow, which analyzes generic bodies with sets for their
+        // parameters, must not see the nested form there.
         auto generic = as<IRGeneric>(outerSpec->getBase());
-        if (!generic || !canSpecializeGeneric(generic) ||
-            !isPerConformanceCandidate(outerSpec))
+        if (!generic || !canSpecializeGeneric(generic) || !isPerConformanceCandidate(outerSpec))
             return false;
         auto flattened = findOrCreateFlattenedGeneric(generic);
         if (!flattened)
@@ -967,27 +979,6 @@ struct SpecializationContext
         return true;
     }
 
-    // Rewrite a specialization of a flattened copy whose arguments have all become static back
-    // into the nested form (see emitNestedFormOfFlattenedSpecialize), so it shares its result
-    // with static call sites instead of producing a second copy of the method.
-    bool maybeRestoreNestedFormOfStaticSpecialize(IRSpecialize* specInst)
-    {
-        if (!specInst->getBase()->findDecoration<IRFlattenedGenericDecoration>())
-            return false;
-        for (UInt i = 0; i < specInst->getArgCount(); ++i)
-            if (isDynamicSpecializationArg(specInst->getArg(i)))
-                return false;
-        IRBuilder builder(module);
-        builder.setInsertBefore(specInst);
-        auto nested = emitNestedFormOfFlattenedSpecialize(builder, specInst);
-        addUsersToWorkList(specInst);
-        specInst->replaceUsesWith(nested);
-        specInst->removeAndDeallocate();
-        addToWorkList(nested);
-        addToWorkList(nested->getBase());
-        return true;
-    }
-
     // Now that we know when we can specialize a generic, and how
     // to do it, we can write a subroutine that takes a
     // `specialize(g, a, b, c, ...)` instruction and performs
@@ -999,8 +990,6 @@ struct SpecializationContext
             return false;
 
         if (maybeFlattenNestedPerConformanceSpecialize(specInst))
-            return true;
-        if (maybeRestoreNestedFormOfStaticSpecialize(specInst))
             return true;
 
         // We will only attempt to specialize when all of the
@@ -4033,6 +4022,8 @@ bool isPerConformanceCandidate(IRSpecialize* specialize)
     UInt argIndex = 0;
     for (auto param : generic->getFirstBlock()->getParams())
     {
+        // A specialization that lacks an argument (e.g. a missing witness for an interface
+        // type argument) is diagnosed by specializeGenericImpl, not specialized per type.
         if (argIndex >= specialize->getArgCount())
             return false;
         auto arg = specialize->getArg(argIndex++);
@@ -4062,10 +4053,11 @@ bool isPerConformanceCandidate(IRSpecialize* specialize)
 // by getConcreteType(), never by their positions or numeric tags. The whole method, including
 // its uses of IA and IB, then runs inside one arm of the dispatcher.
 //
-// Return a dispatcher with the ordinary set-specialization signature, or null. `outMarkedParamHasTypeSet`
-// reports whether the marked `T` received a set of types, so the caller can tell a shape that
-// cannot be specialized per type apart from an ordinary set specialization. Failed attempts can
-// leave unused concrete specializations for normal dead-code elimination.
+// Return a dispatcher with the ordinary set-specialization signature, or null.
+// `outMarkedParamHasTypeSet` reports whether the marked `T` received a set of types, so the
+// caller can tell a method whose signature rules out per-type copies apart from an ordinary set
+// specialization. Failed attempts can leave unused concrete specializations for normal
+// dead-code elimination.
 static IRFunc* trySpecializePerConformance(
     IRSpecialize* specializeInst,
     IRFuncType* dispatchType,
@@ -4073,27 +4065,37 @@ static IRFunc* trySpecializePerConformance(
     UInt specializationDepth,
     bool& outMarkedParamHasTypeSet)
 {
+    SLANG_ASSERT(context);
     outMarkedParamHasTypeSet = false;
     auto generic = cast<IRGeneric>(specializeInst->getBase());
 
+    // The marked `T` receives a set of types when its own argument or the argument of one of
+    // its witnesses is a set. The type argument alone does not show it: types that specialize
+    // to identical declarations can be merged, leaving one type with several witnesses.
     IRParam* typeParam = nullptr;
-    IRUntaggedUnionType* unionType = nullptr;
     UInt typeArgIndex = 0;
     UInt argIndex = 0;
     for (auto param : generic->getFirstBlock()->getParams())
     {
-        auto unionArg = as<IRUntaggedUnionType>(specializeInst->getArg(argIndex));
-        if (unionArg && param->findDecoration<IRSpecializePerConformanceDecoration>())
+        auto arg = specializeInst->getArg(argIndex);
+        if (param->findDecoration<IRSpecializePerConformanceDecoration>())
         {
+            // Lowering marks only the single target parameter of an extension.
+            SLANG_ASSERT(!typeParam);
             typeParam = param;
-            unionType = unionArg;
             typeArgIndex = argIndex;
         }
+        if (findPerConformanceTypeParam(param) &&
+            (as<IRUntaggedUnionType>(arg) || as<IRWitnessTableSet>(arg)))
+            outMarkedParamHasTypeSet = true;
         ++argIndex;
     }
-    if (!typeParam)
+    if (!outMarkedParamHasTypeSet)
         return nullptr;
-    outMarkedParamHasTypeSet = true;
+    // Per-type copies need one distinct concrete type per alternative.
+    auto unionType = as<IRUntaggedUnionType>(specializeInst->getArg(typeArgIndex));
+    if (!unionType)
+        return nullptr;
 
     // Only `T` and the witnesses for its own constraints may receive sets; every other
     // generic argument must be a single static value.
@@ -4160,23 +4162,18 @@ static IRFunc* trySpecializePerConformance(
         // specialization.
         auto concreteTypeSpec = cast<IRSpecialize>(
             builder.emitSpecializeInst(builder.getTypeKind(), generic->getDataType(), args));
-        if (context)
-            context->addSpecializationDepthDecorationsToClonedSpecializeInsts(
-                concreteTypeSpec,
-                specializationDepth);
-        auto concreteSpecializedType = context ? specializeGeneric(context, concreteTypeSpec)
-                                               : specializeGeneric(concreteTypeSpec);
+        context->addSpecializationDepthDecorationsToClonedSpecializeInsts(
+            concreteTypeSpec,
+            specializationDepth);
+        auto concreteSpecializedType = specializeGeneric(context, concreteTypeSpec);
         if (!concreteSpecializedType)
             return nullptr;
         auto concreteSpec = cast<IRSpecialize>(
             builder.emitSpecializeInst(cast<IRType>(concreteSpecializedType), generic, args));
-        if (context)
-            context->addSpecializationDepthDecorationsToClonedSpecializeInsts(
-                concreteSpec,
-                specializationDepth);
-        auto concreteFunc =
-            context ? context->specializeGenericThroughNestedForm(concreteSpec, specializationDepth)
-                    : specializeGeneric(concreteSpec);
+        context->addSpecializationDepthDecorationsToClonedSpecializeInsts(
+            concreteSpec,
+            specializationDepth);
+        auto concreteFunc = specializeGeneric(context, concreteSpec);
         if (!concreteFunc)
             return nullptr;
         // Specializing the body can expand parameter packs and rewrite its type.
@@ -4212,7 +4209,7 @@ static IRFunc* trySpecializePerConformance(
     auto dispatcher = createDispatchFunc(
         dispatchType,
         mapping,
-        context && context->targetProgram ? context->targetProgram->getTargetReq() : nullptr,
+        context->targetProgram ? context->targetProgram->getTargetReq() : nullptr,
         tagCount);
     builder.addNameHintDecoration(dispatcher, UnownedStringSlice("perConformance"));
     return dispatcher;
@@ -4380,7 +4377,10 @@ IRInst* specializeGenericWithSetArgs(
 
             // A Slang 2025 module disallows specializing a generic with an existential.
             // Typeflow admits a marked extension parameter under that rule only because it
-            // is specialized per type, so a shape without per-type copies is still an error.
+            // is specialized per type, and its specializeCall moves the module's mark onto this
+            // set specialization; a shape without per-type copies is therefore still an error.
+            // We go on to build the shared body so the IR stays well formed until compilation
+            // stops on the error.
             if (markedParamHasTypeSet && context && context->sink &&
                 specializeInst
                     ->findDecoration<IRDisallowSpecializationWithExistentialsDecoration>())

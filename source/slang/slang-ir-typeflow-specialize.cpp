@@ -229,10 +229,26 @@ bool isInvalidExistentialSpecialization(IRInst* specializedValue)
 {
     // A marked `extension<T : I> T` parameter may receive an existential even in Slang 2025,
     // because its set of types is resolved by one specialization per type. If that fails,
-    // specializeGenericWithSetArgs reports the specialization instead.
+    // specializeGenericWithSetArgs reports the specialization instead. Arguments for the
+    // method's other parameters are still checked here. Only a generic that returns a function
+    // is specialized per type; any other generic of the extension (a witness table of
+    // `extension<T : I> T : J`, a nested type) keeps the ordinary rule.
     if (auto specialize = as<IRSpecialize>(specializedValue))
-        if (isPerConformanceCandidate(specialize))
+    {
+        auto generic = as<IRGeneric>(specialize->getBase());
+        auto returnVal = generic ? findGenericReturnVal(generic) : nullptr;
+        if (returnVal && returnVal->getOp() == kIROp_Func && isPerConformanceCandidate(specialize))
+        {
+            UInt argIndex = 0;
+            for (auto param : generic->getFirstBlock()->getParams())
+            {
+                auto arg = specialize->getArg(argIndex++);
+                if (!findPerConformanceTypeParam(param) && isSpecArgExistentialDerived(arg))
+                    return true;
+            }
             return false;
+        }
+    }
 
     if (specializedValue->findDecoration<IRDisallowSpecializationWithExistentialsDecoration>())
         return true;
@@ -6992,9 +7008,10 @@ struct TypeFlowSpecializationContext
                 else
                 {
                     // A Slang 2025 caller rules out a shared body for a per-conformance
-                    // callee; the mark (with this call as its location) tells
-                    // specializeGenericWithSetArgs to report a shape it cannot specialize
-                    // per type.
+                    // callee. The mark goes on the set specialization, which is hoisted and
+                    // shared by every call that resolves to it: the first such call supplies
+                    // its location, and specializeGenericWithSetArgs reports E33180 there once
+                    // if the method cannot be specialized per type.
                     if (callee->findDecoration<
                             IRDisallowSpecializationWithExistentialsDecoration>() &&
                         !selectedCallee
@@ -7003,7 +7020,10 @@ struct TypeFlowSpecializationContext
                         builder.addDecoration(
                             selectedCallee,
                             kIROp_DisallowSpecializationWithExistentialsDecoration);
-                        selectedCallee->sourceLoc = inst->sourceLoc;
+                        if (inst->sourceLoc.isValid())
+                            selectedCallee->sourceLoc = inst->sourceLoc;
+                        else if (callee->sourceLoc.isValid())
+                            selectedCallee->sourceLoc = callee->sourceLoc;
                     }
 
                     // Otherwise, we have a single element which is a set specialized generic.

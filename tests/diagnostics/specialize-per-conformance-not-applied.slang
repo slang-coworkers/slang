@@ -2,12 +2,21 @@
 //DIAGNOSTIC_TEST:SIMPLE(diag=REFERENCE):-target hlsl -entry computeMain -DCASE=1 -conformance A:IValue=3 -conformance B:IValue=7
 //DIAGNOSTIC_TEST:SIMPLE(diag=ORDINARY):-target hlsl -entry computeMain -DCASE=2 -conformance A:IValue=3 -conformance B:IValue=7
 //DIAGNOSTIC_TEST:SIMPLE(diag=METHOD_ARG):-target hlsl -entry computeMain -DCASE=3 -conformance A:IValue=3 -conformance B:IValue=7
+//DIAGNOSTIC_TEST:SIMPLE(diag=EXPLICIT):-target hlsl -entry computeMain -DCASE=4 -conformance A:IValue=3 -conformance B:IValue=7
+//DIAGNOSTIC_TEST:SIMPLE(diag=TWO_CALLS):-target hlsl -entry computeMain -DCASE=5 -conformance A:IValue=3 -conformance B:IValue=7
+//DIAGNOSTIC_TEST:SIMPLE(diag=MERGED):-target hlsl -entry computeMain -DCASE=6 -conformance A:IValue=3 -conformance B:IValue=7 -conformance Number<0>:ICode=0 -conformance Number<1>:ICode=1
 
 // Slang 2025 disallows specializing a generic with an existential. The target
 // parameter of `extension<T : IValue> T` is the exception because its set of types
 // is specialized once per type; a method whose signature changes with T cannot be
 // split that way, so it keeps the error, as does an ordinary generic function or an
 // existential passed for a generic parameter of the method itself.
+//
+// METHOD_ARG calls `pair` through a generic wrapper, so its receiver is static and only
+// the method's own parameter receives an existential. EXPLICIT passes an interface type
+// explicitly for that parameter. TWO_CALLS shows that a method that cannot be split is
+// reported once, at the first call. MERGED uses conformers that specialize to one
+// shared struct, so the type set cannot be split per type either.
 #lang slang 2025
 
 interface IValue { uint get(); [mutating] void bump(); }
@@ -22,6 +31,13 @@ extension<T : IValue> T
 }
 
 uint ordinary<T : IValue>(T value) { return value.get(); }
+
+interface ICode { static uint code(); }
+struct Number<let N : uint> : ICode { static uint code() { return N; } }
+extension<T : ICode> T
+{
+    uint codeOf() { return T.code(); }
+}
 
 uint pairWith<V : IValue>(V value, IValue other) { return value.pair(other); }
 //METHOD_ARG:                                                       ^ cannot specialize generic with existential type
@@ -46,7 +62,20 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     outputBuffer[tid.x] = ordinary(a);
 //ORDINARY:                       ^ cannot specialize generic with existential type
 //ORDINARY:                       ^ specializing 'ordinary' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
-#else
+#elif CASE == 3
     outputBuffer[tid.x] = pairWith(A(), a);
+#elif CASE == 4
+    outputBuffer[tid.x] = a.pair<IValue>(A());
+//EXPLICIT:                             ^ cannot specialize generic with existential type
+//EXPLICIT:                             ^ specializing 'pair' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
+#elif CASE == 5
+    outputBuffer[tid.x] = a.changingResult().get();
+//TWO_CALLS:                              ^ cannot specialize generic with existential type
+//TWO_CALLS:                              ^ specializing 'changingResult' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
+    outputBuffer[tid.y] = a.changingResult().get();
+#else
+    outputBuffer[tid.x] = createDynamicObject<ICode>(tid.x, 0u).codeOf();
+//MERGED:                                                             ^ cannot specialize generic with existential type
+//MERGED:                                                             ^ specializing 'codeOf' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
 #endif
 }

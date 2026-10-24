@@ -3,6 +3,11 @@
 //TEST(compute):COMPARE_COMPUTE_EX(filecheck-buffer=CHECK):-vk -compute -shaderobj -output-using-type
 //TEST:SIMPLE(filecheck=HLSL):-target hlsl -entry computeMain -conformance A:IValue=7 -conformance B:IValue=3
 //TEST:SIMPLE(filecheck=SPIRV):-target spirv -entry computeMain -conformance A:IValue=7 -conformance B:IValue=3
+//TEST:SIMPLE(filecheck=HLSL):-target hlsl -entry computeMain -conformance A:IValue=7 -conformance B:IValue=3 -DLANG2025
+
+#ifdef LANG2025
+#lang slang 2025
+#endif
 
 interface IA { uint a(); }
 interface IB { uint b(); }

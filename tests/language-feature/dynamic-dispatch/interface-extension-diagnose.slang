@@ -56,6 +56,7 @@ float calcTwice(IInterface obj, float y)
     return obj.calcTwice(y);
 #else
     // Only the ordinary generic function is diagnosed.
+    // CHECK-NOT: specializing 'calcTwice'
     // CHECK: error[E33180]
     // CHECK: specializing 'calcTwiceGeneric' with an existential type
     // CHECK-NOT: error[E33180]
@@ -76,10 +77,12 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID)
     outputBuffer[1] = f(1, 3);
 }
 
-// One copy of calcTwice per conforming type, each calling its own calc directly.
-// HLSL: float calcTwice_[[N0:[0-9]+]](float
-// HLSL-NEXT: {
-// HLSL: _calc_
-// HLSL: float calcTwice_[[N1:[0-9]+]](float
-// HLSL-NEXT: {
-// HLSL: _calc_
+// One copy of calcTwice per conforming type, each calling its own type's calc directly
+// rather than through a dispatch function.
+// HLSL: float calcTwice_{{[0-9]+}}(float
+// HLSL-NOT: }
+// HLSL: = {{A|B}}_calc_
+// HLSL: float calcTwice_{{[0-9]+}}(float
+// HLSL-NOT: }
+// HLSL: = {{A|B}}_calc_
+// HLSL-NOT: _dispatch_

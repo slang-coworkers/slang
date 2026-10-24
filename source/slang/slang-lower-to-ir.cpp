@@ -13502,20 +13502,23 @@ struct DeclLoweringVisitor : DeclVisitor<DeclLoweringVisitor, LoweredValInfo>
         emitGenericConstraintDecl(subContext, constraintDeclRef);
     }
 
-    // Return the type parameter `T` of a generic extension `extension<T : IFoo> T`, or null when
-    // `genericDecl` is not such an extension. Members of that extension behave like interface
-    // methods: a set of types passed for `T` is specialized once per type, so we mark `T` to
-    // separate it from the extension's ordinary generic arguments.
+    // Return the type parameter `T` that a generic extension `extension<T : IFoo> T` extends, or
+    // null when `genericDecl` is not such an extension. Methods of that extension behave like
+    // interface methods: a set of types passed for `T` is specialized once per type, so we mark
+    // `T` to separate it from parameters that must receive a single static argument.
+    //
+    // Every IR generic emitted for the extension's GenericDecl carries the mark, including those
+    // of accessors, nested types and the witness table of `extension<T : IBase> T : IFoo`. Only
+    // calls of functions act on it: the per-type specialization of a generic that returns a
+    // function, and the flattening of a method with its own generic parameters. For the other
+    // generics the mark at most keeps an intermediate generic alive until the specialization
+    // pass ends (SpecializationContext::specializeGeneric).
     static GenericTypeParamDecl* findExtensionTargetTypeParamDecl(GenericDecl* genericDecl)
     {
         auto extensionDecl = as<ExtensionDecl>(genericDecl->inner);
         if (!extensionDecl)
             return nullptr;
-        auto targetParamDeclRef =
-            isDeclRefTypeOf<GenericTypeParamDecl>(extensionDecl->targetType.type);
-        if (!targetParamDeclRef || targetParamDeclRef.getDecl()->parentDecl != genericDecl)
-            return nullptr;
-        return targetParamDeclRef.getDecl();
+        return isDeclRefTypeOf<GenericTypeParamDecl>(extensionDecl->targetType.type).getDecl();
     }
 
     IRGeneric* emitGenericDecl(IRGenContext* subContext, DeclRef<GenericDecl> genericDeclRef)
@@ -13531,6 +13534,8 @@ struct DeclLoweringVisitor : DeclVisitor<DeclLoweringVisitor, LoweredValInfo>
         auto irBlock = subBuilder->emitBlock();
         subBuilder->setInsertInto(irBlock);
 
+        // Compared with this generic's own type parameters below, so a target that names any
+        // other declaration marks nothing.
         auto extensionTargetParamDecl = findExtensionTargetTypeParamDecl(genericDecl);
 
         // Now emit any parameters of the generic

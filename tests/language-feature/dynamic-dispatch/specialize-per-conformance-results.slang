@@ -3,6 +3,13 @@
 //TEST(compute):COMPARE_COMPUTE_EX(filecheck-buffer=CHECK):-vk -compute -shaderobj -output-using-type
 //TEST:SIMPLE(filecheck=HLSL):-target hlsl -entry computeMain -conformance A:IValue=3 -conformance B:IValue=7
 //TEST:SIMPLE(filecheck=SPIRV):-target spirv -entry computeMain -conformance A:IValue=3 -conformance B:IValue=7
+//TEST:SIMPLE(filecheck=HLSL):-target hlsl -entry computeMain -conformance A:IValue=3 -conformance B:IValue=7 -DLANG2025
+
+// A shared body would give the same buffer values, so the HLSL checks look for one copy of
+// each method per type, and the Slang 2025 run compiles only if every copy was formed.
+#ifdef LANG2025
+#lang slang 2025
+#endif
 
 interface IValue { uint get(); }
 struct A : IValue { uint get() { return 2; } }
@@ -47,6 +54,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
 // CHECK: 15
 // CHECK: 11
 // CHECK: 1
-// HLSL: = readMarker
-// HLSL: = readMarker
+// HLSL-COUNT-2: bool positive_{{[0-9]+}}()
+// HLSL-COUNT-2: float weight_{{[0-9]+}}()
+// HLSL-COUNT-2: = readMarker
 // SPIRV: OpEntryPoint GLCompute

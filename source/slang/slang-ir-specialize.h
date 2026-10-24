@@ -41,15 +41,16 @@ IRInst* specializeGeneric(IRSpecialize* specInst);
 /// Run local specialization opportunities exposed under an already-materialized IR value.
 bool specializeChildInsts(SpecializationContext* context, IRInst* rootInst);
 
-/// Return the type parameter marked for per-conformance specialization that generic parameter
-/// `param` belongs to: `param` itself when it is the target `T` of `extension<T : I> T`, that `T`
-/// when `param` is a witness for one of its constraints, or null otherwise.
+/// Return the per-conformance type parameter that generic parameter `param` is or constrains:
+/// `param` itself when it is the marked target `T` of `extension<T : I> T`, that `T` when
+/// `param` is a witness for one of its constraints, or null for any other parameter.
 IRParam* findPerConformanceTypeParam(IRParam* param);
 
 /// Return whether `specialize` binds runtime arguments (local values, or sets of possibilities
 /// from type-flow analysis) only to one per-conformance type parameter and the witnesses
-/// constraining it. Such a specialization is resolved by one concrete specialization per type
-/// rather than by a shared body.
+/// constraining it. This tests only the arguments' shape: such a specialization is attempted as
+/// one concrete specialization per type, and still falls back to a shared body when the
+/// method's signature changes with the type.
 bool isPerConformanceCandidate(IRSpecialize* specialize);
 
 } // namespace Slang
