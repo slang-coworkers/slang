@@ -2200,7 +2200,8 @@ local insts = {
 			},
 			{
 				SpecializePerConformance = {
-					-- Request whole-helper specialization over a bounded conformance set.
+					-- On the target type parameter `T` of `extension<T : I> T`: a set of
+					-- types passed for `T` is specialized once per concrete type.
 					struct_name = "SpecializePerConformanceDecoration",
 				},
 			},
@@ -2350,8 +2351,8 @@ local insts = {
 			},
 			{
 				ConstrainedTypeDecoration = {
-					-- On a generic witness parameter, records the type parameter whose
-					-- conformance this witness supplies. Multiple constraints may share it.
+					-- On a witness parameter constraining a SpecializePerConformance type
+					-- parameter, records that type parameter. Multiple constraints may share it.
 					operands = { { "constrainedType" } },
 				},
 			},

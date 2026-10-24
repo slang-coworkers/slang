@@ -19,13 +19,16 @@ void acceptCandidate(uint candidate, inout uint state)
     state += candidate;
 }
 
-[__specializePerConformance]
-[ForceInline]
-void visit<G : IOperation>(G geometry, inout uint state)
+// Lowering marks `G` of this extension, so a dynamic `G` gets one copy of `visit` per type.
+extension<G : IOperation> G
 {
-    uint candidate;
-    if (G.evaluate(readContext(state), candidate))
-        acceptCandidate(candidate, state);
+    [ForceInline]
+    void visit(inout uint state)
+    {
+        uint candidate;
+        if (G.evaluate(readContext(state), candidate))
+            acceptCandidate(candidate, state);
+    }
 }
 
 //TEST_INPUT: type_conformance First:IOperation = 3
@@ -40,7 +43,7 @@ RWStructuredBuffer<uint> outputBuffer;
 void computeMain(uint3 tid : SV_DispatchThreadID)
 {
     uint state = tid.x;
-    visit(createDynamicObject<IOperation>(ids[tid.x], 0u), state);
+    createDynamicObject<IOperation>(ids[tid.x], 0u).visit(state);
     outputBuffer[tid.x] = state;
 }
 
@@ -49,8 +52,8 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
 // CHECK: 3
 // CHECK: 27
 
-// Each concrete helper reads the current state before evaluating its operation,
-// then accepts only on success. A single shared helper must fail this check.
+// Each concrete copy reads the current state before evaluating its operation,
+// then accepts only on success. A single shared body must fail this check.
 // HLSL: = readContext
 // HLSL: acceptCandidate
 // HLSL: = readContext

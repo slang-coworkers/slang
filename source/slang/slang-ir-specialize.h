@@ -6,6 +6,7 @@ namespace Slang
 struct IRModule;
 struct IRInst;
 struct IRFunc;
+struct IRParam;
 struct IRSpecialize;
 struct SpecializationContext;
 class DiagnosticSink;
@@ -39,5 +40,16 @@ IRInst* specializeGeneric(IRSpecialize* specInst);
 
 /// Run local specialization opportunities exposed under an already-materialized IR value.
 bool specializeChildInsts(SpecializationContext* context, IRInst* rootInst);
+
+/// Return the type parameter marked for per-conformance specialization that generic parameter
+/// `param` belongs to: `param` itself when it is the target `T` of `extension<T : I> T`, that `T`
+/// when `param` is a witness for one of its constraints, or null otherwise.
+IRParam* getPerConformanceTypeParam(IRParam* param);
+
+/// Return whether `specialize` binds runtime arguments (local values, or sets of possibilities
+/// from type-flow analysis) only to one per-conformance type parameter and the witnesses
+/// constraining it. Such a specialization is resolved by one concrete specialization per type
+/// rather than by a shared body.
+bool isPerConformanceSpecialization(IRSpecialize* specialize);
 
 } // namespace Slang

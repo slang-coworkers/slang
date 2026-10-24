@@ -1,51 +1,43 @@
-//DIAGNOSTIC_TEST:SIMPLE(diag=RESULT_WARNING):-target hlsl -entry computeMain -DCASE=0 -conformance A:IValue=3 -conformance B:IValue=7
-//DIAGNOSTIC_TEST:SIMPLE(diag=RESULT_ERROR):-target hlsl -entry computeMain -DCASE=0 -conformance A:IValue=3 -conformance B:IValue=7 -warnings-as-errors 55219
-//DIAGNOSTIC_TEST:SIMPLE(diag=REFERENCE_WARNING):-target hlsl -entry computeMain -DCASE=1 -conformance A:IValue=3 -conformance B:IValue=7
-//DIAGNOSTIC_TEST:SIMPLE(diag=REFERENCE_ERROR):-target hlsl -entry computeMain -DCASE=1 -conformance A:IValue=3 -conformance B:IValue=7 -warnings-as-errors 55219
-//DIAGNOSTIC_TEST:SIMPLE(diag=INDEPENDENT_WARNING):-target hlsl -entry computeMain -DCASE=2 -conformance A:IValue=3 -conformance B:IValue=7
-//DIAGNOSTIC_TEST:SIMPLE(diag=INDEPENDENT_ERROR):-target hlsl -entry computeMain -DCASE=2 -conformance A:IValue=3 -conformance B:IValue=7 -warnings-as-errors 55219
+//DIAGNOSTIC_TEST:SIMPLE(diag=RESULT):-target hlsl -entry computeMain -DCASE=0 -conformance A:IValue=3 -conformance B:IValue=7
+//DIAGNOSTIC_TEST:SIMPLE(diag=REFERENCE):-target hlsl -entry computeMain -DCASE=1 -conformance A:IValue=3 -conformance B:IValue=7
+//DIAGNOSTIC_TEST:SIMPLE(diag=ORDINARY):-target hlsl -entry computeMain -DCASE=2 -conformance A:IValue=3 -conformance B:IValue=7
 
-interface IValue { uint get(); }
-struct A : IValue { uint get() { return 2; } }
-struct B : IValue { uint get() { return 5; } }
+// Slang 2025 disallows specializing a generic with an existential. The target
+// parameter of `extension<T : IValue> T` is the exception because its set of types
+// is specialized once per type; a method whose signature changes with T cannot be
+// split that way, so it keeps the error, as does an ordinary generic function.
+#lang slang 2025
 
-[__specializePerConformance]
-T changingResult<T : IValue>(T value) { return value; }
+interface IValue { uint get(); [mutating] void bump(); }
+struct A : IValue { uint v; uint get() { return 2; } [mutating] void bump() { v++; } }
+struct B : IValue { uint v; uint get() { return 5; } [mutating] void bump() { v += 2; } }
 
-[__specializePerConformance]
-uint reference<T : IValue>(inout T value) { return value.get(); }
+extension<T : IValue> T
+{
+    T changingResult() { return this; }
+    [mutating] void reference() { this.bump(); }
+}
 
-[__specializePerConformance]
-uint independent<T : IValue, U : IValue>(T a, U b) { return a.get() + b.get(); }
-
-// Open the existential through a by-value generic call before taking an inout
-// reference. Passing the existential local directly fails front-end type checking.
-uint callReference<T : IValue>(T value) { return reference(value); }
+uint ordinary<T : IValue>(T value) { return value.get(); }
 
 RWStructuredBuffer<uint> outputBuffer;
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void computeMain(uint3 tid : SV_DispatchThreadID)
 {
-    let a = createDynamicObject<IValue>(tid.x, 0u);
-    let b = createDynamicObject<IValue>(tid.y, 0u);
+    var a = createDynamicObject<IValue>(tid.x, 0u);
 #if CASE == 0
-    outputBuffer[tid.x] = changingResult(a).get();
+    outputBuffer[tid.x] = a.changingResult().get();
+//RESULT:                                 ^ cannot specialize generic with existential type
+//RESULT:                                 ^ specializing 'changingResult' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
 #elif CASE == 1
-    outputBuffer[tid.x] = callReference(a);
+    a.reference();
+//REFERENCE:   ^ cannot specialize generic with existential type
+//REFERENCE:   ^ specializing 'reference' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
+    outputBuffer[tid.x] = a.get();
 #else
-    outputBuffer[tid.x] = independent(a, b);
+    outputBuffer[tid.x] = ordinary(a);
+//ORDINARY:                       ^ cannot specialize generic with existential type
+//ORDINARY:                       ^ specializing 'ordinary' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
 #endif
 }
-//RESULT_WARNING: warning E55219
-//RESULT_WARNING: the return type changes across concrete specializations
-//RESULT_ERROR: error E55219
-//RESULT_ERROR: the return type changes across concrete specializations
-//REFERENCE_WARNING: warning E55219
-//REFERENCE_WARNING: type-changing reference or nested payload parameters are not supported
-//REFERENCE_ERROR: error E55219
-//REFERENCE_ERROR: type-changing reference or nested payload parameters are not supported
-//INDEPENDENT_WARNING: warning E55219
-//INDEPENDENT_WARNING: multiple independent dynamic types are not supported
-//INDEPENDENT_ERROR: error E55219
-//INDEPENDENT_ERROR: multiple independent dynamic types are not supported

@@ -227,6 +227,13 @@ static bool isSpecArgExistentialDerived(IRInst* inst, int depth = 0)
 
 bool isInvalidExistentialSpecialization(IRInst* specializedValue)
 {
+    // A marked `extension<T : I> T` parameter may receive an existential even in Slang 2025,
+    // because its set of types is resolved by one specialization per type. If that fails,
+    // specializeGenericWithSetArgs reports the specialization instead.
+    if (auto specialize = as<IRSpecialize>(specializedValue))
+        if (isPerConformanceSpecialization(specialize))
+            return false;
+
     if (specializedValue->findDecoration<IRDisallowSpecializationWithExistentialsDecoration>())
         return true;
 
@@ -6984,6 +6991,21 @@ struct TypeFlowSpecializationContext
                 }
                 else
                 {
+                    // A Slang 2025 caller rules out a shared body for a per-conformance
+                    // callee; the mark (with this call as its location) tells
+                    // specializeGenericWithSetArgs to report a shape it cannot specialize
+                    // per type.
+                    if (callee->findDecoration<
+                            IRDisallowSpecializationWithExistentialsDecoration>() &&
+                        !selectedCallee
+                             ->findDecoration<IRDisallowSpecializationWithExistentialsDecoration>())
+                    {
+                        builder.addDecoration(
+                            selectedCallee,
+                            kIROp_DisallowSpecializationWithExistentialsDecoration);
+                        selectedCallee->sourceLoc = inst->sourceLoc;
+                    }
+
                     // Otherwise, we have a single element which is a set specialized generic.
                     // Add in the arguments for the set specialization.
                     //

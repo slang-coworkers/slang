@@ -1,8 +1,8 @@
 //TEST(compute):COMPARE_COMPUTE_EX(filecheck-buffer=CHECK):-cpu -compute -shaderobj -output-using-type
 //TEST(compute):COMPARE_COMPUTE_EX(filecheck-buffer=CHECK):-dx12 -compute -shaderobj -output-using-type
 //TEST(compute):COMPARE_COMPUTE_EX(filecheck-buffer=CHECK):-vk -compute -shaderobj -output-using-type
-//TEST:SIMPLE(filecheck=HLSL):-target hlsl -entry computeMain -conformance A:IValue=7 -conformance B:IValue=3 -warnings-as-errors 55219
-//TEST:SIMPLE(filecheck=SPIRV):-target spirv -entry computeMain -conformance A:IValue=7 -conformance B:IValue=3 -warnings-as-errors 55219
+//TEST:SIMPLE(filecheck=HLSL):-target hlsl -entry computeMain -conformance A:IValue=7 -conformance B:IValue=3
+//TEST:SIMPLE(filecheck=SPIRV):-target spirv -entry computeMain -conformance A:IValue=7 -conformance B:IValue=3
 
 interface IA { uint a(); }
 interface IB { uint b(); }
@@ -13,11 +13,10 @@ struct B : IValue { uint a() { return 5; } uint b() { return 7; } }
 uint readMarker(inout uint state) { return state++; }
 
 // IA and IB produce distinct witness sets and runtime tag namespaces. Both
-// constrain T, so the complete helper must select matching concrete witnesses.
-[__specializePerConformance]
-uint combine<T : IA & IB>(T value, inout uint state)
+// constrain T, so each concrete copy must select matching concrete witnesses.
+extension<T : IA & IB> T
 {
-    return readMarker(state) + value.a() * value.b();
+    uint combine(inout uint state) { return readMarker(state) + this.a() * this.b(); }
 }
 
 //TEST_INPUT: type_conformance A:IValue = 7
@@ -31,7 +30,7 @@ RWStructuredBuffer<uint> outputBuffer;
 void computeMain(uint3 tid : SV_DispatchThreadID)
 {
     uint state = 10;
-    outputBuffer[tid.x * 2] = combine(createDynamicObject<IValue>(ids[tid.x], 0u), state);
+    outputBuffer[tid.x * 2] = createDynamicObject<IValue>(ids[tid.x], 0u).combine(state);
     outputBuffer[tid.x * 2 + 1] = state;
 }
 // CHECK: 16

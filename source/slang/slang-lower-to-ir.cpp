@@ -13413,14 +13413,14 @@ struct DeclLoweringVisitor : DeclVisitor<DeclLoweringVisitor, LoweredValInfo>
             {
                 auto typeParamDeclVal = subContext->findLoweredDecl(genParamDeclRef.getDecl());
                 SLANG_ASSERT(typeParamDeclVal && typeParamDeclVal->val);
-                subBuilder->addTypeConstraintDecoration(typeParamDeclVal->val, supType);
-                // Keep the checked constraint's subtype on its witness parameter.
-                // For `T : IA & IB`, both witnesses constrain T; matching interface
-                // names or sets of possible witnesses later cannot prove that relation.
-                subBuilder->addDecoration(
-                    param,
-                    kIROp_ConstrainedTypeDecoration,
-                    typeParamDeclVal->val);
+                auto typeParam = typeParamDeclVal->val;
+                subBuilder->addTypeConstraintDecoration(typeParam, supType);
+                // Per-conformance specialization selects, for each concrete type of a marked
+                // `T`, the witnesses for that same type. For `T : IA & IB` both witness
+                // parameters constrain T, which equal sets of possible witnesses cannot prove,
+                // so we record the checked relation on the witness parameter.
+                if (typeParam->findDecoration<IRSpecializePerConformanceDecoration>())
+                    subBuilder->addDecoration(param, kIROp_ConstrainedTypeDecoration, typeParam);
             }
 
             return param;
@@ -13502,6 +13502,22 @@ struct DeclLoweringVisitor : DeclVisitor<DeclLoweringVisitor, LoweredValInfo>
         emitGenericConstraintDecl(subContext, constraintDeclRef);
     }
 
+    // Return the type parameter `T` of a generic extension `extension<T : IFoo> T`, or null when
+    // `genericDecl` is not such an extension. Members of that extension behave like interface
+    // methods: a set of types passed for `T` is specialized once per type, so we mark `T` to
+    // separate it from the extension's ordinary generic arguments.
+    static GenericTypeParamDecl* getExtensionTargetTypeParamDecl(GenericDecl* genericDecl)
+    {
+        auto extensionDecl = as<ExtensionDecl>(genericDecl->inner);
+        if (!extensionDecl)
+            return nullptr;
+        auto targetParamDeclRef =
+            isDeclRefTypeOf<GenericTypeParamDecl>(extensionDecl->targetType.type);
+        if (!targetParamDeclRef || targetParamDeclRef.getDecl()->parentDecl != genericDecl)
+            return nullptr;
+        return targetParamDeclRef.getDecl();
+    }
+
     IRGeneric* emitGenericDecl(IRGenContext* subContext, DeclRef<GenericDecl> genericDeclRef)
     {
         auto genericDecl = genericDeclRef.getDecl();
@@ -13514,6 +13530,8 @@ struct DeclLoweringVisitor : DeclVisitor<DeclLoweringVisitor, LoweredValInfo>
 
         auto irBlock = subBuilder->emitBlock();
         subBuilder->setInsertInto(irBlock);
+
+        auto extensionTargetParamDecl = getExtensionTargetTypeParamDecl(genericDecl);
 
         // Now emit any parameters of the generic
         //
@@ -13530,6 +13548,8 @@ struct DeclLoweringVisitor : DeclVisitor<DeclLoweringVisitor, LoweredValInfo>
                     typeKind = subBuilder->getTypeType();
                 auto param = subBuilder->emitParam(typeKind);
                 addNameHint(context, param, typeParamDecl);
+                if (typeParamDecl == extensionTargetParamDecl)
+                    subBuilder->addDecoration(param, kIROp_SpecializePerConformanceDecoration);
                 subContext->setValue(typeParamDecl, LoweredValInfo::simple(param));
             }
             else if (auto valPackDecl = as<GenericValuePackParamDecl>(member))
@@ -13641,10 +13661,6 @@ struct DeclLoweringVisitor : DeclVisitor<DeclLoweringVisitor, LoweredValInfo>
         auto irWitnessTableParam =
             subBuilder->emitParam(subBuilder->getWitnessTableType(irInterfaceType));
         subBuilder->addTypeConstraintDecoration(irThisTypeParam, irInterfaceType);
-        subBuilder->addDecoration(
-            irWitnessTableParam,
-            kIROp_ConstrainedTypeDecoration,
-            irThisTypeParam);
 
         // Now we need to wire up the IR parameters
         // we created to be used as the `ThisType` in
@@ -15209,18 +15225,6 @@ struct DeclLoweringVisitor : DeclVisitor<DeclLoweringVisitor, LoweredValInfo>
             {
                 getBuilder()->addDecoration(irFunc, kIROp_ForceInlineDecoration);
                 isInline = true;
-            }
-            else if (as<SpecializePerConformanceAttribute>(modifier))
-            {
-                if (isForceInlineEarly(decl))
-                {
-                    Diagnostics::SpecializePerConformanceNotApplied diag = {};
-                    diag.location = modifier->loc;
-                    diag.reason = "early forced inlining removes the helper boundary";
-                    getSink()->diagnose(diag);
-                }
-                else
-                    getBuilder()->addDecoration(irFunc, kIROp_SpecializePerConformanceDecoration);
             }
             else if (auto intrinsicOp = as<IntrinsicOpModifier>(modifier))
             {

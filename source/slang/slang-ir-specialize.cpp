@@ -49,6 +49,33 @@ IRInst* specializeGenericImpl(
     SpecializationContext* context,
     bool queueFollowUpWork);
 
+// Returns true if `arg` is a specialization argument that is only known at runtime: a local
+// value such as one extracted from an existential, or a set of possibilities from typeflow.
+// A module-scope interface type is not a runtime argument: no per-type copies can replace it.
+static bool isDynamicSpecializationArg(IRInst* arg)
+{
+    return arg->getParent()->getOp() != kIROp_ModuleInst || as<IRSetBase>(arg) ||
+           as<IRUntaggedUnionType>(arg);
+}
+
+// Report that the generic `genericVal` (named by its return value's name hint) cannot be
+// specialized with an existential argument.
+static void diagnoseCannotSpecializeGenericWithExistential(
+    DiagnosticSink* sink,
+    IRGeneric* genericVal,
+    SourceLoc location)
+{
+    String genericName;
+    if (auto inner = findGenericReturnVal(genericVal))
+        if (auto nameHint = inner->findDecoration<IRNameHintDecoration>())
+            genericName = nameHint->getName();
+    if (genericName.getLength() == 0)
+        genericName = "<generic>";
+    sink->diagnose(Diagnostics::CannotSpecializeGenericWithExistential{
+        .generic = genericName,
+        .location = location});
+}
+
 struct SpecializationContext
 {
     // For convenience, we will keep a pointer to the module
@@ -780,17 +807,10 @@ struct SpecializationContext
             // Only emit E33180 if no other diagnostic was already produced (e.g. by
             // the specialization depth budget check).
             if (sink && sink->getErrorCount() == errorsBefore)
-            {
-                String genericName;
-                if (auto inner = findGenericReturnVal(genericVal))
-                    if (auto nameHint = inner->findDecoration<IRNameHintDecoration>())
-                        genericName = nameHint->getName();
-                if (genericName.getLength() == 0)
-                    genericName = "<generic>";
-                sink->diagnose(Diagnostics::CannotSpecializeGenericWithExistential{
-                    .generic = genericName,
-                    .location = specInst->sourceLoc});
-            }
+                diagnoseCannotSpecializeGenericWithExistential(
+                    sink,
+                    genericVal,
+                    specInst->sourceLoc);
             // Replace the specialize instruction with a poison value to prevent
             // later passes from encountering an unresolvable specialize instruction.
             IRBuilder builder(module);
@@ -3749,86 +3769,112 @@ void finalizeSpecialization(IRModule* module)
     }
 }
 
-// Specialize a helper for each concrete type in a closed dynamic type set.
+IRParam* getPerConformanceTypeParam(IRParam* param)
+{
+    if (param->findDecoration<IRSpecializePerConformanceDecoration>())
+        return param;
+    if (auto constraint = param->findDecoration<IRConstrainedTypeDecoration>())
+        return as<IRParam>(constraint->getConstrainedType());
+    return nullptr;
+}
+
+bool isPerConformanceSpecialization(IRSpecialize* specialize)
+{
+    auto generic = as<IRGeneric>(specialize->getBase());
+    if (!generic)
+        return false;
+    IRParam* typeParam = nullptr;
+    UInt argIndex = 0;
+    for (auto param : generic->getFirstBlock()->getParams())
+    {
+        if (argIndex >= specialize->getArgCount())
+            return false;
+        auto arg = specialize->getArg(argIndex++);
+        if (!isDynamicSpecializationArg(arg))
+            continue;
+        auto owner = getPerConformanceTypeParam(param);
+        if (!owner || (typeParam && owner != typeParam))
+            return false;
+        typeParam = owner;
+    }
+    return typeParam != nullptr;
+}
+
+// Specialize an extension method once for each concrete type in a closed set of types.
 // Consider this example:
 //
-//     [__specializePerConformance]
-//     uint combine<T : IA & IB>(T value) { return value.a() * value.b(); }
+//     extension<T : IA & IB> T
+//     {
+//         uint combine() { return this.a() * this.b(); }
+//     }
 //
-// Typeflow supplies one dynamic type
-// argument and separate witness sets for IA and IB. The constraints belong to T,
-// so each concrete copy must receive the witnesses for the same concrete type.
-// Pair witnesses by getConcreteType(), never by their positions or numeric tags.
-// This keeps the whole helper, including its callers of IA and IB, in one arm.
+//     createDynamicObject<IValue>(typeID, payload).combine();
 //
-// Return a dispatcher with the ordinary set-specialization signature, or null.
-// A marked helper that cannot be specialized supplies a diagnostic reason;
-// unmarked helpers leave that reason null. Failed attempts can leave unused
-// concrete specializations for normal dead-code elimination.
+// Lowering marks `T` with SpecializePerConformanceDecoration. Typeflow supplies one set of
+// types for `T` and separate witness sets for IA and IB. The constraints belong to `T`, so
+// each concrete copy must receive the witnesses for the same concrete type: we pair witnesses
+// by getConcreteType(), never by their positions or numeric tags. The whole method, including
+// its uses of IA and IB, then runs inside one arm of the dispatcher.
+//
+// Return a dispatcher with the ordinary set-specialization signature, or null. `outRequested`
+// reports whether the marked `T` received a set of types, so the caller can tell a shape that
+// cannot be specialized per type apart from an ordinary set specialization. Failed attempts can
+// leave unused concrete specializations for normal dead-code elimination.
 static IRFunc* trySpecializeHelperPerConformance(
     IRSpecialize* specializeInst,
     IRFuncType* dispatchType,
     SpecializationContext* context,
     UInt specializationDepth,
-    const char*& failureReason)
+    bool& outRequested)
 {
-    failureReason = nullptr;
+    outRequested = false;
     auto generic = cast<IRGeneric>(specializeInst->getBase());
-    auto originalFunc = cast<IRFunc>(findGenericReturnVal(generic));
-    if (!originalFunc->findDecoration<IRSpecializePerConformanceDecoration>())
-        return nullptr;
 
-    failureReason = "expected one dynamic type with a closed set of conformances";
-    IRUntaggedUnionType* unionType = nullptr;
     IRParam* typeParam = nullptr;
+    IRUntaggedUnionType* unionType = nullptr;
     UInt typeArgIndex = 0;
-    List<IRParam*> witnessParams;
+    UInt argIndex = 0;
+    for (auto param : generic->getFirstBlock()->getParams())
+    {
+        auto unionArg = as<IRUntaggedUnionType>(specializeInst->getArg(argIndex));
+        if (unionArg && param->findDecoration<IRSpecializePerConformanceDecoration>())
+        {
+            typeParam = param;
+            unionType = unionArg;
+            typeArgIndex = argIndex;
+        }
+        ++argIndex;
+    }
+    if (!typeParam)
+        return nullptr;
+    outRequested = true;
+
+    // Only `T` and the witnesses for its own constraints may receive sets; every other
+    // generic argument must be a single static value.
     List<UInt> witnessArgIndices;
     List<IRWitnessTableSet*> witnessSets;
-    UInt argIndex = 0;
+    argIndex = 0;
     for (auto param : generic->getFirstBlock()->getParams())
     {
         auto arg = specializeInst->getArg(argIndex);
         if (auto set = as<IRWitnessTableSet>(arg))
         {
-            if (set->isUnbounded() || set->isEmpty())
+            if (getPerConformanceTypeParam(param) != typeParam || set->isUnbounded() ||
+                set->isEmpty())
                 return nullptr;
-            witnessParams.add(param);
             witnessArgIndices.add(argIndex);
             witnessSets.add(set);
         }
-        else if (auto type = as<IRUntaggedUnionType>(arg))
-        {
-            if (unionType)
-            {
-                failureReason = "multiple independent dynamic types are not supported";
-                return nullptr;
-            }
-            unionType = type;
-            typeParam = param;
-            typeArgIndex = argIndex;
-        }
-        else if (as<IRSetBase>(arg))
+        else if (param != typeParam && (as<IRSetBase>(arg) || as<IRUntaggedUnionType>(arg)))
             return nullptr;
         ++argIndex;
     }
-    if (!unionType || witnessSets.getCount() == 0)
+    if (witnessSets.getCount() == 0)
         return nullptr;
-
-    // Lowering preserves the checked subtype on each witness parameter. Require
-    // that exact parameter, not merely equal sets or matching interface names.
-    failureReason = "witness constraints do not all belong to the dynamic type parameter";
-    for (auto param : witnessParams)
-    {
-        auto constraint = param->findDecoration<IRConstrainedTypeDecoration>();
-        if (!constraint || constraint->getConstrainedType() != typeParam)
-            return nullptr;
-    }
 
     IRBuilder builder(specializeInst->getModule());
     builder.setInsertInto(specializeInst->getModule());
     List<Dictionary<IRInst*, IRWitnessTable*>> witnessesByType;
-    failureReason = "witness sets must uniquely describe constraints of the same dynamic type";
     for (auto set : witnessSets)
     {
         Dictionary<IRInst*, IRWitnessTable*> witnesses;
@@ -3849,22 +3895,7 @@ static IRFunc* trySpecializeHelperPerConformance(
         witnessesByType.add(witnesses);
     }
 
-    // These provisional resource limits protect explicit requests from excessive
-    // duplication. They do not estimate profitability or bound downstream inlining.
-    static const UInt kMaxConformers = 8;
     auto witnessSet = witnessSets[0];
-    failureReason = "the request exceeds the current resource limit of 8 concrete copies";
-    if (witnessSet->getCount() > kMaxConformers)
-        return nullptr;
-    static const UInt kMaxDuplicatedInsts = 1024;
-    failureReason =
-        "the request exceeds the current resource limit of 1024 duplicated IR instructions";
-    UInt instCount = 0;
-    for (auto block : originalFunc->getBlocks())
-        for (auto inst = block->getFirstChild(); inst; inst = inst->getNextInst())
-            if (++instCount > kMaxDuplicatedInsts / witnessSet->getCount())
-                return nullptr;
-
     Dictionary<IRInst*, std::pair<IRInst*, IRFuncType*>> mapping;
     auto tagCount = UInt(witnessSets.getCount());
     for (UInt i = 0; i < witnessSet->getCount(); ++i)
@@ -3877,17 +3908,16 @@ static IRFunc* trySpecializeHelperPerConformance(
         args[typeArgIndex] = concreteType;
         for (Index j = 0; j < witnessSets.getCount(); ++j)
             args[witnessArgIndices[j]] = witnessesByType[j].getValue(concreteType);
-        // In combine<A>(value), both the function and its type must use A and
-        // its witnesses. The incoming specialization still has the dynamic
-        // signature, so specialize the generic's type with the same arguments
-        // before constructing the concrete function specialization.
+        // In combine<A>(), both the function and its type must use A and its witnesses.
+        // The incoming specialization still has the dynamic signature, so specialize the
+        // generic's type with the same arguments before constructing the concrete function
+        // specialization.
         auto concreteTypeSpec = cast<IRSpecialize>(
             builder.emitSpecializeInst(builder.getTypeKind(), generic->getDataType(), args));
         if (context)
             context->addSpecializationDepthDecorationsToClonedSpecializeInsts(
                 concreteTypeSpec,
                 specializationDepth);
-        failureReason = "concrete generic specialization could not be completed";
         auto concreteSpecializedType = context ? specializeGeneric(context, concreteTypeSpec)
                                                : specializeGeneric(concreteTypeSpec);
         if (!concreteSpecializedType)
@@ -3909,13 +3939,13 @@ static IRFunc* trySpecializeHelperPerConformance(
 
         // Fixed concrete results need no conversion. Dynamic results would require
         // choosing a common representation and possibly reconstructing a result tag.
-        failureReason = "the return type changes across concrete specializations";
         if (dispatchType->getResultType() != concreteFuncType->getResultType())
             return nullptr;
-        failureReason = "concrete specialization changes the parameter count";
         if (dispatchType->getParamCount() != concreteFuncType->getParamCount() + tagCount)
             return nullptr;
-        failureReason = "type-changing reference or nested payload parameters are not supported";
+        // Only a by-value `T` payload changes type between the dispatcher and a concrete
+        // copy; the dispatcher marshals it. Type-changing references and nested payloads
+        // would need separate temporaries, which can change aliasing and copy-back behavior.
         for (UInt j = 0; j < concreteFuncType->getParamCount(); ++j)
         {
             auto paramType = dispatchType->getParamType(j + tagCount);
@@ -3938,7 +3968,6 @@ static IRFunc* trySpecializeHelperPerConformance(
         context && context->targetProgram ? context->targetProgram->getTargetReq() : nullptr,
         tagCount);
     builder.addNameHintDecoration(dispatcher, UnownedStringSlice("perConformance"));
-    failureReason = nullptr;
     return dispatcher;
 }
 
@@ -4090,25 +4119,29 @@ IRInst* specializeGenericWithSetArgs(
 
             // Decide the dispatch boundary before cloning a shared body. The concrete path
             // uses the same tag-parameter ABI, so callers need no special handling.
-            const char* specializationFailure = nullptr;
+            bool perConformanceRequested = false;
             if (auto dispatcher = trySpecializeHelperPerConformance(
                     specializeInst,
                     dispatchType,
                     context,
                     specializationDepth,
-                    specializationFailure))
+                    perConformanceRequested))
             {
                 loweredFunc->removeAndDeallocate();
                 return dispatcher;
             }
 
-            if (specializationFailure && context && context->sink)
-            {
-                Diagnostics::SpecializePerConformanceNotApplied diag = {};
-                diag.location = returnedFunc->sourceLoc;
-                diag.reason = specializationFailure;
-                context->sink->diagnose(diag);
-            }
+            // A Slang 2025 module disallows specializing a generic with an existential.
+            // Typeflow admits a marked extension parameter under that rule only because it
+            // is specialized per type, so a shape without per-type copies is still an error.
+            if (perConformanceRequested && context && context->sink &&
+                specializeInst
+                    ->findDecoration<IRDisallowSpecializationWithExistentialsDecoration>())
+                diagnoseCannotSpecializeGenericWithExistential(
+                    context->sink,
+                    generic,
+                    specializeInst->sourceLoc.isValid() ? specializeInst->sourceLoc
+                                                        : returnedFunc->sourceLoc);
 
             builder.setInsertBefore(loweredFunc->getFirstBlock());
             for (auto decoration : returnedFunc->getDecorations())

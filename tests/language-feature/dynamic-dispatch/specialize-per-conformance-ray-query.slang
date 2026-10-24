@@ -1,7 +1,7 @@
 //TEST:SIMPLE(filecheck=DXIL):-target dxil-asm -profile sm_6_6 -O3 -entry computeMain -conformance Near:IGeometry=3 -conformance Far:IGeometry=7
 //TEST:SIMPLE(filecheck=SPIRV):-target spirv-asm -profile sm_6_6 -O3 -entry computeMain -conformance Near:IGeometry=3 -conformance Far:IGeometry=7
 
-// Both query-state reads and acceptance must remain inside the selected helper.
+// Both query-state reads and acceptance must remain inside the selected copy.
 // CommittedRayT changes after acceptance, so repeated iterations also exercise
 // the boundary that prevents treating query getters as freely movable pure values.
 interface IGeometry
@@ -25,12 +25,14 @@ struct Far : IGeometry
     }
 }
 
-[__specializePerConformance]
-void intersectCase<G : IGeometry>(G geometry, inout RayQuery<0> query)
+extension<G : IGeometry> G
 {
-    float distance = G.distance(query.CandidateObjectRayOrigin(), query.CommittedRayT());
-    if (distance > query.RayTMin())
-        query.CommitProceduralPrimitiveHit(distance);
+    void intersectCase(inout RayQuery<0> query)
+    {
+        float distance = G.distance(query.CandidateObjectRayOrigin(), query.CommittedRayT());
+        if (distance > query.RayTMin())
+            query.CommitProceduralPrimitiveHit(distance);
+    }
 }
 
 RaytracingAccelerationStructure scene;
@@ -49,7 +51,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
         if (query.CandidateType() == CANDIDATE_PROCEDURAL_PRIMITIVE)
         {
             uint id = geometryTypes[query.CandidatePrimitiveIndex()];
-            intersectCase(createDynamicObject<IGeometry>(id, 0u), query);
+            createDynamicObject<IGeometry>(id, 0u).intersectCase(query);
         }
     }
     outputBuffer[tid.x] = query.CommittedRayT();

@@ -3,7 +3,7 @@
 //TEST:SIMPLE(filecheck=HLSL):-target hlsl -entry computeMain -conformance GeometryA:IGeometry=3 -conformance GeometryB:IGeometry=7
 
 // Related to #13245: construction and consumption of an associated result stay
-// together inside a concrete helper. The public-ID mapping is still necessary.
+// together inside a concrete copy. The public-ID mapping is still necessary.
 interface IHit
 {
     uint evaluate();
@@ -39,11 +39,13 @@ struct GeometryB : IGeometry
     static Hit unpack(uint value) { return {uint2(value, value * 2)}; }
 }
 
-[__specializePerConformance]
-void evaluate<G : IGeometry>(G geometry, uint value, out uint result)
+extension<G : IGeometry> G
 {
-    let hit = G.unpack(value);
-    result = hit.evaluate();
+    void evaluate(uint value, out uint result)
+    {
+        let hit = G.unpack(value);
+        result = hit.evaluate();
+    }
 }
 
 //TEST_INPUT: type_conformance GeometryA:IGeometry = 3
@@ -57,7 +59,7 @@ RWStructuredBuffer<uint> outputBuffer;
 [numthreads(2, 1, 1)]
 void computeMain(uint3 tid : SV_DispatchThreadID)
 {
-    evaluate(createDynamicObject<IGeometry>(ids[tid.x], 0u), tid.x + 1, outputBuffer[tid.x]);
+    createDynamicObject<IGeometry>(ids[tid.x], 0u).evaluate(tid.x + 1, outputBuffer[tid.x]);
 }
 
 // CHECK: 11
