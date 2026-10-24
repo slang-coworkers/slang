@@ -2356,6 +2356,13 @@ local insts = {
 					operands = { { "constrainedType" } },
 				},
 			},
+			{
+				FlattenedGenericDecoration = {
+					-- On a generic built by merging a generic with the generic it returns,
+					-- records the original. Its leading parameters are the original's.
+					operands = { { "originalGeneric" } },
+				},
+			},
 			{ BuiltinDecoration = {} },
 			{
 				requiresNVAPI = {

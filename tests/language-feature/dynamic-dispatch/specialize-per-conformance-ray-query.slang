@@ -1,9 +1,12 @@
 //TEST:SIMPLE(filecheck=DXIL):-target dxil-asm -profile sm_6_6 -O3 -entry computeMain -conformance Near:IGeometry=3 -conformance Far:IGeometry=7
 //TEST:SIMPLE(filecheck=SPIRV):-target spirv-asm -profile sm_6_6 -O3 -entry computeMain -conformance Near:IGeometry=3 -conformance Far:IGeometry=7
+//TEST:SIMPLE(filecheck=DXIL):-target dxil-asm -profile sm_6_6 -O3 -entry computeMain -conformance Near:IGeometry=3 -conformance Far:IGeometry=7 -DQUERY_FLAGS
+//TEST:SIMPLE(filecheck=SPIRV):-target spirv-asm -profile sm_6_6 -O3 -entry computeMain -conformance Near:IGeometry=3 -conformance Far:IGeometry=7 -DQUERY_FLAGS
 
 // Both query-state reads and acceptance must remain inside the selected copy.
 // CommittedRayT changes after acceptance, so repeated iterations also exercise
 // the boundary that prevents treating query getters as freely movable pure values.
+// With QUERY_FLAGS the method is also generic over the query flags.
 interface IGeometry
 {
     static float distance(float3 origin, float limit);
@@ -27,7 +30,11 @@ struct Far : IGeometry
 
 extension<G : IGeometry> G
 {
+#ifdef QUERY_FLAGS
+    void intersectCase<let Flags : uint>(inout RayQuery<Flags> query)
+#else
     void intersectCase(inout RayQuery<0> query)
+#endif
     {
         float distance = G.distance(query.CandidateObjectRayOrigin(), query.CommittedRayT());
         if (distance > query.RayTMin())

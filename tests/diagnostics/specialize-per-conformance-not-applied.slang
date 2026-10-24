@@ -1,11 +1,13 @@
 //DIAGNOSTIC_TEST:SIMPLE(diag=RESULT):-target hlsl -entry computeMain -DCASE=0 -conformance A:IValue=3 -conformance B:IValue=7
 //DIAGNOSTIC_TEST:SIMPLE(diag=REFERENCE):-target hlsl -entry computeMain -DCASE=1 -conformance A:IValue=3 -conformance B:IValue=7
 //DIAGNOSTIC_TEST:SIMPLE(diag=ORDINARY):-target hlsl -entry computeMain -DCASE=2 -conformance A:IValue=3 -conformance B:IValue=7
+//DIAGNOSTIC_TEST:SIMPLE(diag=METHOD_ARG):-target hlsl -entry computeMain -DCASE=3 -conformance A:IValue=3 -conformance B:IValue=7
 
 // Slang 2025 disallows specializing a generic with an existential. The target
 // parameter of `extension<T : IValue> T` is the exception because its set of types
 // is specialized once per type; a method whose signature changes with T cannot be
-// split that way, so it keeps the error, as does an ordinary generic function.
+// split that way, so it keeps the error, as does an ordinary generic function or an
+// existential passed for a generic parameter of the method itself.
 #lang slang 2025
 
 interface IValue { uint get(); [mutating] void bump(); }
@@ -16,9 +18,14 @@ extension<T : IValue> T
 {
     T changingResult() { return this; }
     [mutating] void reference() { this.bump(); }
+    uint pair<U : IValue>(U other) { return this.get() * 10 + other.get(); }
 }
 
 uint ordinary<T : IValue>(T value) { return value.get(); }
+
+uint pairWith<V : IValue>(V value, IValue other) { return value.pair(other); }
+//METHOD_ARG:                                                       ^ cannot specialize generic with existential type
+//METHOD_ARG:                                                       ^ specializing 'pair' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
 
 RWStructuredBuffer<uint> outputBuffer;
 [shader("compute")]
@@ -35,9 +42,11 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
 //REFERENCE:   ^ cannot specialize generic with existential type
 //REFERENCE:   ^ specializing 'reference' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
     outputBuffer[tid.x] = a.get();
-#else
+#elif CASE == 2
     outputBuffer[tid.x] = ordinary(a);
 //ORDINARY:                       ^ cannot specialize generic with existential type
 //ORDINARY:                       ^ specializing 'ordinary' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
+#else
+    outputBuffer[tid.x] = pairWith(A(), a);
 #endif
 }

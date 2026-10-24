@@ -881,5 +881,6 @@ return {
 	["Decoration.AutodiffParameterContextTypeDecoration"] = 905,
 	["DebugLexicalBlock"] = 906,
 	["Decoration.SpecializePerConformance"] = 907,
-	["Decoration.ConstrainedTypeDecoration"] = 908
+	["Decoration.ConstrainedTypeDecoration"] = 908,
+	["Decoration.FlattenedGenericDecoration"] = 910
 }

@@ -58,6 +58,14 @@ static bool isDynamicSpecializationArg(IRInst* arg)
            as<IRUntaggedUnionType>(arg);
 }
 
+static bool hasPerConformanceTypeParam(IRGeneric* generic)
+{
+    for (auto param : generic->getParams())
+        if (param->findDecoration<IRSpecializePerConformanceDecoration>())
+            return true;
+    return false;
+}
+
 // Report that the generic `genericVal` (named by its return value's name hint) cannot be
 // specialized with an existential argument.
 static void diagnoseCannotSpecializeGenericWithExistential(
@@ -76,6 +84,72 @@ static void diagnoseCannotSpecializeGenericWithExistential(
         .location = location});
 }
 
+// Return whether flattenNestedGeneric can merge `outer` with the generic it returns: `outer`
+// returns a generic, and the type of each inner parameter depends on nothing but the parameters
+// of `outer`.
+static bool canFlattenNestedGeneric(IRGeneric* outer)
+{
+    auto inner = as<IRGeneric>(findGenericReturnVal(outer));
+    if (!inner)
+        return false;
+    auto outerBlock = outer->getFirstBlock();
+    for (auto param : inner->getParams())
+    {
+        auto paramType = param->getFullType();
+        bool isOuterParam = as<IRParam>(paramType) && paramType->getParent() == outerBlock;
+        if (paramType->getParent()->getOp() != kIROp_ModuleInst && !isOuterParam)
+            return false;
+    }
+    return true;
+}
+
+// Return a generic whose parameters are those of `outer` followed by those of the generic that
+// `outer` returns, and which returns what that inner generic returns. Consider this example:
+//
+//     extension<T : IInterface> T { float calcN<let N : int>(float x) { ... } }
+//
+// `calcN` lowers to generic<T, w> { generic<N> { func } }, and the call obj.calcN<2>(x) to
+// specialize(specialize(g, T', w'), 2). The flattened generic<T, w, N> { func } accepts both
+// argument lists in one specialize instruction. `outer` must satisfy canFlattenNestedGeneric.
+static IRGeneric* flattenNestedGeneric(IRBuilder& builder, IRGeneric* outer)
+{
+    SLANG_ASSERT(canFlattenNestedGeneric(outer));
+    auto inner = cast<IRGeneric>(findGenericReturnVal(outer));
+    auto outerBlock = outer->getFirstBlock();
+
+    builder.setInsertAfter(outer);
+    auto flattened = builder.emitGeneric();
+    builder.setInsertInto(flattened);
+    builder.setInsertInto(builder.emitBlock());
+
+    IRCloneEnv env;
+    for (auto param : outer->getParams())
+        cloneInst(&env, &builder, param);
+    for (auto param : inner->getParams())
+        cloneInst(&env, &builder, param);
+
+    IRInst* returnVal = nullptr;
+    for (auto inst : outerBlock->getOrdinaryInsts())
+    {
+        if (as<IRReturn>(inst))
+            continue;
+        if (inst != inner)
+        {
+            cloneInst(&env, &builder, inst);
+            continue;
+        }
+        for (auto innerInst : inner->getFirstBlock()->getOrdinaryInsts())
+        {
+            if (auto innerReturn = as<IRReturn>(innerInst))
+                returnVal = findCloneForOperand(&env, innerReturn->getVal());
+            else
+                cloneInst(&env, &builder, innerInst);
+        }
+    }
+    builder.emitReturn(returnVal);
+    return flattened;
+}
+
 struct SpecializationContext
 {
     // For convenience, we will keep a pointer to the module
@@ -86,6 +160,10 @@ struct SpecializationContext
     SpecializationOptions options;
     bool changed = false;
     Dictionary<IRSimpleSpecializationKey, IRSpecialize*> activeGenericSpecializations;
+
+    // KeepAlive decorations this pass added to intermediate generics of per-conformance
+    // methods (see specializeGeneric); they are removed when the pass finishes.
+    List<IRInst*> perConformanceKeepAliveDecorations;
 
 
     SpecializationContext(IRModule* inModule, TargetProgram* target, SpecializationOptions options)
@@ -101,6 +179,8 @@ struct SpecializationContext
     }
     ~SpecializationContext()
     {
+        for (auto decoration : perConformanceKeepAliveDecorations)
+            decoration->removeAndDeallocate();
         module->getContainerPool().free(&workList);
         module->getContainerPool().free(&workListSet);
         module->getContainerPool().free(&cleanInsts);
@@ -624,6 +704,19 @@ struct SpecializationContext
         //
         builder.setCompilerDictionaryEntryValue(entry, specializedVal);
 
+        // Specializing an extension generic whose method has its own generic parameters yields
+        // an intermediate generic. The per-type copies of that method are specialized from it in
+        // a later round (specializeGenericThroughNestedForm), to reuse the functions that static
+        // calls produced. Compiler-dictionary values are weak, so we keep the intermediate alive
+        // until this pass finishes.
+        if (as<IRGeneric>(specializedVal) && hasPerConformanceTypeParam(genericVal) &&
+            !specializedVal->findDecoration<IRKeepAliveDecoration>())
+        {
+            builder.addKeepAliveDecoration(specializedVal);
+            perConformanceKeepAliveDecorations.add(
+                specializedVal->findDecoration<IRKeepAliveDecoration>());
+        }
+
         return specializedVal;
     }
 
@@ -747,6 +840,154 @@ struct SpecializationContext
         return hasNonTrivialUses;
     }
 
+    // Return the flattened copy of the nested per-conformance generic `generic` (see
+    // flattenNestedGeneric), creating it when no live copy exists, or null when it cannot be
+    // flattened. The copy records `generic` in a FlattenedGenericDecoration, which is how any
+    // specialization context finds it again.
+    IRGeneric* getFlattenedPerConformanceGeneric(IRGeneric* generic)
+    {
+        for (auto use = generic->firstUse; use; use = use->nextUse)
+        {
+            if (auto decoration = as<IRFlattenedGenericDecoration>(use->getUser()))
+                if (auto existing = as<IRGeneric>(decoration->getParent()))
+                    return existing;
+        }
+
+        auto genericType = as<IRGeneric>(generic->getDataType());
+        if (!genericType || !canFlattenNestedGeneric(generic) ||
+            !canFlattenNestedGeneric(genericType))
+            return nullptr;
+        IRBuilder builder(module);
+        auto flattenedType = flattenNestedGeneric(builder, genericType);
+        auto flattened = flattenNestedGeneric(builder, generic);
+        flattened->setFullType((IRType*)flattenedType);
+        builder.addDecoration(flattened, kIROp_FlattenedGenericDecoration, generic);
+        return flattened;
+    }
+
+    // Return specialize(specialize(g, a...), b...), the nested form that static call sites of
+    // a method use, for specialize(flattened(g), a..., b...); or null when the base of
+    // `flatSpec` is not a flattened copy.
+    IRSpecialize* emitNestedFormOfFlattenedSpecialize(IRBuilder& builder, IRSpecialize* flatSpec)
+    {
+        auto origin = flatSpec->getBase()->findDecoration<IRFlattenedGenericDecoration>();
+        if (!origin)
+            return nullptr;
+        auto original = cast<IRGeneric>(origin->getOriginalGeneric());
+        UInt outerParamCount = 0;
+        for ([[maybe_unused]] auto param : original->getParams())
+            ++outerParamCount;
+        List<IRInst*> outerArgs;
+        List<IRInst*> innerArgs;
+        for (UInt i = 0; i < flatSpec->getArgCount(); ++i)
+            (i < outerParamCount ? outerArgs : innerArgs).add(flatSpec->getArg(i));
+        auto outerType =
+            builder.emitSpecializeInst(builder.getTypeKind(), original->getDataType(), outerArgs);
+        auto outerSpec = builder.emitSpecializeInst((IRType*)outerType, original, outerArgs);
+        return cast<IRSpecialize>(
+            builder.emitSpecializeInst(flatSpec->getFullType(), outerSpec, innerArgs));
+    }
+
+    // Specialize `specInst`, whose arguments are all static, to the value it denotes. For
+    // specialize(flattened(g), a..., b...) we specialize its nested form instead, so a per-type
+    // copy of a method is the same function that a static call of that method produces.
+    IRInst* specializeGenericThroughNestedForm(IRSpecialize* specInst, UInt specializationDepth)
+    {
+        IRBuilder builder(module);
+        builder.setInsertInto(module);
+        auto nested = emitNestedFormOfFlattenedSpecialize(builder, specInst);
+        if (!nested)
+            return Slang::specializeGeneric(this, specInst);
+        auto outerSpec = cast<IRSpecialize>(nested->getBase());
+        addSpecializationDepthDecorationsToClonedSpecializeInsts(outerSpec, specializationDepth);
+        auto innerGeneric = as<IRGeneric>(Slang::specializeGeneric(this, outerSpec));
+        if (!innerGeneric)
+            return nullptr;
+        List<IRInst*> innerArgs;
+        for (UInt i = 0; i < nested->getArgCount(); ++i)
+            innerArgs.add(nested->getArg(i));
+        auto innerSpec = cast<IRSpecialize>(
+            builder.emitSpecializeInst(nested->getFullType(), innerGeneric, innerArgs));
+        addSpecializationDepthDecorationsToClonedSpecializeInsts(innerSpec, specializationDepth);
+        return Slang::specializeGeneric(this, innerSpec);
+    }
+
+    // Rewrite specialize(specialize(g, a...), b...) into specialize(flattened(g), a..., b...)
+    // when the arguments `a` bind the per-conformance parameter of `g` dynamically. Per-type
+    // specialization of a set of types handles a generic that returns a function; in the nested
+    // shape, the outer generic would instead be evaluated with that set before its inner
+    // arguments are known.
+    bool maybeFlattenNestedPerConformanceSpecialize(IRSpecialize* specInst)
+    {
+        auto outerSpec = as<IRSpecialize>(specInst->getBase());
+        if (!outerSpec)
+            return false;
+        // Code inside a generic is specialized again before it runs, and a static
+        // specialization keeps the nested form, so only code outside generics is rewritten.
+        if (specInst->getParent()->getOp() != kIROp_ModuleInst)
+        {
+            auto func = getParentFunc(specInst);
+            if (!func || func->getParent()->getOp() != kIROp_ModuleInst)
+                return false;
+        }
+        auto generic = as<IRGeneric>(outerSpec->getBase());
+        if (!generic || !canSpecializeGeneric(generic) ||
+            !isPerConformanceSpecialization(outerSpec))
+            return false;
+        auto flattened = getFlattenedPerConformanceGeneric(generic);
+        if (!flattened)
+            return false;
+
+        List<IRInst*> args;
+        for (UInt i = 0; i < outerSpec->getArgCount(); ++i)
+            args.add(outerSpec->getArg(i));
+        for (UInt i = 0; i < specInst->getArgCount(); ++i)
+            args.add(specInst->getArg(i));
+
+        IRBuilder builder(module);
+        builder.setInsertBefore(specInst);
+        auto flatSpec = cast<IRSpecialize>(
+            builder.emitSpecializeInst(specInst->getFullType(), flattened, args));
+        flatSpec->sourceLoc =
+            specInst->sourceLoc.isValid() ? specInst->sourceLoc : outerSpec->sourceLoc;
+        // A Slang 2025 module may have marked either specialization for its existential
+        // arguments; the flattened one receives all of them.
+        if ((outerSpec->findDecoration<IRDisallowSpecializationWithExistentialsDecoration>() ||
+             specInst->findDecoration<IRDisallowSpecializationWithExistentialsDecoration>()) &&
+            !flatSpec->findDecoration<IRDisallowSpecializationWithExistentialsDecoration>())
+            builder.addDecoration(flatSpec, kIROp_DisallowSpecializationWithExistentialsDecoration);
+        auto depth = Math::Max(getSpecializationDepth(outerSpec), getSpecializationDepth(specInst));
+        if (depth > getSpecializationDepth(flatSpec))
+            addSpecializationDepthDecoration(flatSpec, depth);
+
+        addUsersToWorkList(specInst);
+        specInst->replaceUsesWith(flatSpec);
+        specInst->removeAndDeallocate();
+        addToWorkList(flatSpec);
+        return true;
+    }
+
+    // Rewrite a specialization of a flattened copy whose arguments have all become static back
+    // into the nested form (see emitNestedFormOfFlattenedSpecialize), so it shares its result
+    // with static call sites instead of producing a second copy of the method.
+    bool maybeRestoreNestedFormOfStaticSpecialize(IRSpecialize* specInst)
+    {
+        if (!specInst->getBase()->findDecoration<IRFlattenedGenericDecoration>())
+            return false;
+        for (UInt i = 0; i < specInst->getArgCount(); ++i)
+            if (isDynamicSpecializationArg(specInst->getArg(i)))
+                return false;
+        IRBuilder builder(module);
+        builder.setInsertBefore(specInst);
+        auto nested = emitNestedFormOfFlattenedSpecialize(builder, specInst);
+        addUsersToWorkList(specInst);
+        specInst->replaceUsesWith(nested);
+        specInst->removeAndDeallocate();
+        addToWorkList(nested);
+        addToWorkList(nested->getBase());
+        return true;
+    }
+
     // Now that we know when we can specialize a generic, and how
     // to do it, we can write a subroutine that takes a
     // `specialize(g, a, b, c, ...)` instruction and performs
@@ -756,6 +997,11 @@ struct SpecializationContext
     {
         if (cleanInsts.contains(specInst))
             return false;
+
+        if (maybeFlattenNestedPerConformanceSpecialize(specInst))
+            return true;
+        if (maybeRestoreNestedFormOfStaticSpecialize(specInst))
+            return true;
 
         // We will only attempt to specialize when all of the
         // operands to the `speicalize(...)` instruction are
@@ -3929,7 +4175,8 @@ static IRFunc* trySpecializeHelperPerConformance(
                 concreteSpec,
                 specializationDepth);
         auto concreteFunc =
-            context ? specializeGeneric(context, concreteSpec) : specializeGeneric(concreteSpec);
+            context ? context->specializeGenericThroughNestedForm(concreteSpec, specializationDepth)
+                    : specializeGeneric(concreteSpec);
         if (!concreteFunc)
             return nullptr;
         // Specializing the body can expand parameter packs and rewrite its type.
