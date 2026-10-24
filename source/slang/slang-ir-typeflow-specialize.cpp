@@ -231,7 +231,7 @@ bool isInvalidExistentialSpecialization(IRInst* specializedValue)
     // because its set of types is resolved by one specialization per type. If that fails,
     // specializeGenericWithSetArgs reports the specialization instead.
     if (auto specialize = as<IRSpecialize>(specializedValue))
-        if (isPerConformanceSpecialization(specialize))
+        if (isPerConformanceCandidate(specialize))
             return false;
 
     if (specializedValue->findDecoration<IRDisallowSpecializationWithExistentialsDecoration>())

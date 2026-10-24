@@ -844,7 +844,7 @@ struct SpecializationContext
     // flattenNestedGeneric), creating it when no live copy exists, or null when it cannot be
     // flattened. The copy records `generic` in a FlattenedGenericDecoration, which is how any
     // specialization context finds it again.
-    IRGeneric* getFlattenedPerConformanceGeneric(IRGeneric* generic)
+    IRGeneric* findOrCreateFlattenedGeneric(IRGeneric* generic)
     {
         for (auto use = generic->firstUse; use; use = use->nextUse)
         {
@@ -932,9 +932,9 @@ struct SpecializationContext
         }
         auto generic = as<IRGeneric>(outerSpec->getBase());
         if (!generic || !canSpecializeGeneric(generic) ||
-            !isPerConformanceSpecialization(outerSpec))
+            !isPerConformanceCandidate(outerSpec))
             return false;
-        auto flattened = getFlattenedPerConformanceGeneric(generic);
+        auto flattened = findOrCreateFlattenedGeneric(generic);
         if (!flattened)
             return false;
 
@@ -4015,7 +4015,7 @@ void finalizeSpecialization(IRModule* module)
     }
 }
 
-IRParam* getPerConformanceTypeParam(IRParam* param)
+IRParam* findPerConformanceTypeParam(IRParam* param)
 {
     if (param->findDecoration<IRSpecializePerConformanceDecoration>())
         return param;
@@ -4024,7 +4024,7 @@ IRParam* getPerConformanceTypeParam(IRParam* param)
     return nullptr;
 }
 
-bool isPerConformanceSpecialization(IRSpecialize* specialize)
+bool isPerConformanceCandidate(IRSpecialize* specialize)
 {
     auto generic = as<IRGeneric>(specialize->getBase());
     if (!generic)
@@ -4038,7 +4038,7 @@ bool isPerConformanceSpecialization(IRSpecialize* specialize)
         auto arg = specialize->getArg(argIndex++);
         if (!isDynamicSpecializationArg(arg))
             continue;
-        auto owner = getPerConformanceTypeParam(param);
+        auto owner = findPerConformanceTypeParam(param);
         if (!owner || (typeParam && owner != typeParam))
             return false;
         typeParam = owner;
@@ -4062,18 +4062,18 @@ bool isPerConformanceSpecialization(IRSpecialize* specialize)
 // by getConcreteType(), never by their positions or numeric tags. The whole method, including
 // its uses of IA and IB, then runs inside one arm of the dispatcher.
 //
-// Return a dispatcher with the ordinary set-specialization signature, or null. `outRequested`
+// Return a dispatcher with the ordinary set-specialization signature, or null. `outMarkedParamHasTypeSet`
 // reports whether the marked `T` received a set of types, so the caller can tell a shape that
 // cannot be specialized per type apart from an ordinary set specialization. Failed attempts can
 // leave unused concrete specializations for normal dead-code elimination.
-static IRFunc* trySpecializeHelperPerConformance(
+static IRFunc* trySpecializePerConformance(
     IRSpecialize* specializeInst,
     IRFuncType* dispatchType,
     SpecializationContext* context,
     UInt specializationDepth,
-    bool& outRequested)
+    bool& outMarkedParamHasTypeSet)
 {
-    outRequested = false;
+    outMarkedParamHasTypeSet = false;
     auto generic = cast<IRGeneric>(specializeInst->getBase());
 
     IRParam* typeParam = nullptr;
@@ -4093,7 +4093,7 @@ static IRFunc* trySpecializeHelperPerConformance(
     }
     if (!typeParam)
         return nullptr;
-    outRequested = true;
+    outMarkedParamHasTypeSet = true;
 
     // Only `T` and the witnesses for its own constraints may receive sets; every other
     // generic argument must be a single static value.
@@ -4105,7 +4105,7 @@ static IRFunc* trySpecializeHelperPerConformance(
         auto arg = specializeInst->getArg(argIndex);
         if (auto set = as<IRWitnessTableSet>(arg))
         {
-            if (getPerConformanceTypeParam(param) != typeParam || set->isUnbounded() ||
+            if (findPerConformanceTypeParam(param) != typeParam || set->isUnbounded() ||
                 set->isEmpty())
                 return nullptr;
             witnessArgIndices.add(argIndex);
@@ -4366,13 +4366,13 @@ IRInst* specializeGenericWithSetArgs(
 
             // Decide the dispatch boundary before cloning a shared body. The concrete path
             // uses the same tag-parameter ABI, so callers need no special handling.
-            bool perConformanceRequested = false;
-            if (auto dispatcher = trySpecializeHelperPerConformance(
+            bool markedParamHasTypeSet = false;
+            if (auto dispatcher = trySpecializePerConformance(
                     specializeInst,
                     dispatchType,
                     context,
                     specializationDepth,
-                    perConformanceRequested))
+                    markedParamHasTypeSet))
             {
                 loweredFunc->removeAndDeallocate();
                 return dispatcher;
@@ -4381,7 +4381,7 @@ IRInst* specializeGenericWithSetArgs(
             // A Slang 2025 module disallows specializing a generic with an existential.
             // Typeflow admits a marked extension parameter under that rule only because it
             // is specialized per type, so a shape without per-type copies is still an error.
-            if (perConformanceRequested && context && context->sink &&
+            if (markedParamHasTypeSet && context && context->sink &&
                 specializeInst
                     ->findDecoration<IRDisallowSpecializationWithExistentialsDecoration>())
                 diagnoseCannotSpecializeGenericWithExistential(

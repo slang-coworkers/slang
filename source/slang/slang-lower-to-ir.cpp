@@ -13506,7 +13506,7 @@ struct DeclLoweringVisitor : DeclVisitor<DeclLoweringVisitor, LoweredValInfo>
     // `genericDecl` is not such an extension. Members of that extension behave like interface
     // methods: a set of types passed for `T` is specialized once per type, so we mark `T` to
     // separate it from the extension's ordinary generic arguments.
-    static GenericTypeParamDecl* getExtensionTargetTypeParamDecl(GenericDecl* genericDecl)
+    static GenericTypeParamDecl* findExtensionTargetTypeParamDecl(GenericDecl* genericDecl)
     {
         auto extensionDecl = as<ExtensionDecl>(genericDecl->inner);
         if (!extensionDecl)
@@ -13531,7 +13531,7 @@ struct DeclLoweringVisitor : DeclVisitor<DeclLoweringVisitor, LoweredValInfo>
         auto irBlock = subBuilder->emitBlock();
         subBuilder->setInsertInto(irBlock);
 
-        auto extensionTargetParamDecl = getExtensionTargetTypeParamDecl(genericDecl);
+        auto extensionTargetParamDecl = findExtensionTargetTypeParamDecl(genericDecl);
 
         // Now emit any parameters of the generic
         //
