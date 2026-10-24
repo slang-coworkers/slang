@@ -57,8 +57,10 @@ are still E33180 in Slang 2025):
 - a second dynamic type, for example a method generic parameter that receives
   another existential;
 - conforming types that specialize to one shared type, such as empty
-  specializations of one generic struct, which leave a single type with several
-  witnesses.
+  specializations of one generic struct, when the method has more than one
+  constraint on `T`. Such conformers leave a single type with several witnesses; with
+  one constraint each witness gets its own copy, but witnesses of two constraints
+  cannot be paired by type.
 
 In Slang 2025 the error for such a method is reported once, at the first call that
 reaches its shared set specialization; other calls of the method with the same set
@@ -106,8 +108,10 @@ constraint. `specializeGenericWithSetArgs` builds the ordinary signature with on
 leading tag per witness set, then first calls `trySpecializePerConformance`. That
 function requires every other argument to be a single static value, indexes each
 witness set by `getConcreteType()`, and checks that every set covers exactly the
-alternatives of the type set, with one witness per type. It specializes the generic
-and its type once per type through `specializeGeneric` and checks each resulting
+alternatives of the type set, with one witness per type. When the alternatives
+specialize to one shared type, `T` receives that type itself, and a method with a
+single constraint gets one copy per witness instead. It specializes the generic
+and its type once per alternative through `specializeGeneric` and checks each resulting
 signature against the dispatcher. No witness-entry positions, numeric-tag equality,
 structural equivalence relation, or new substitution algorithm are used.
 
@@ -140,7 +144,8 @@ existential conversions remain separate work.
 - `tests/language-feature/dynamic-dispatch/specialize-per-conformance*.slang`: CPU,
   Vulkan and D3D12 results plus HLSL, SPIR-V and DXIL structure checks for per-type
   copies, multiple constraints, fixed results, concrete references, associated
-  results, separately compiled conformers, nine conformers, a single conformer, ray
+  results, separately compiled conformers, nine conformers, a single conformer,
+  conformers that share one type, ray
   queries (also generic over the query flags) and methods with their own generic
   parameters, including calls from another generic function. Slang 2025 variants of
   several of them compile only if every copy was formed.
