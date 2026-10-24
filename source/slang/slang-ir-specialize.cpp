@@ -930,8 +930,8 @@ struct SpecializationContext
     // shape, the outer generic would instead be evaluated with that set before its inner
     // arguments are known.
     //
-    // The flattened form only ever describes such a dynamic call: once its arguments are all
-    // static, specializeGeneric evaluates it through the nested form again
+    // The flattened form describes a call whose arguments are not yet all static: once they
+    // are, specializeGeneric evaluates it through the nested form again
     // (specializeFlattenedThroughNestedForm).
     bool maybeFlattenNestedPerConformanceSpecialize(IRSpecialize* specInst)
     {
@@ -4092,10 +4092,8 @@ static IRFunc* trySpecializePerConformance(
     }
     if (!outMarkedParamHasTypeSet)
         return nullptr;
-    // Per-type copies need one distinct concrete type per alternative.
-    auto unionType = as<IRUntaggedUnionType>(specializeInst->getArg(typeArgIndex));
-    if (!unionType)
-        return nullptr;
+    auto typeArg = specializeInst->getArg(typeArgIndex);
+    auto unionType = as<IRUntaggedUnionType>(typeArg);
 
     // Only `T` and the witnesses for its own constraints may receive sets; every other
     // generic argument must be a single static value.
@@ -4122,28 +4120,49 @@ static IRFunc* trySpecializePerConformance(
 
     IRBuilder builder(specializeInst->getModule());
     builder.setInsertInto(specializeInst->getModule());
-    List<Dictionary<IRInst*, IRWitnessTable*>> witnessesByType;
-    for (auto set : witnessSets)
+
+    // Each alternative of the first witness set gets one copy. Usually `T` receives a set of
+    // distinct types, and the witnesses of each further constraint are paired with that
+    // alternative by their concrete type. When the alternatives specialize to one shared type
+    // (empty specializations of one generic struct, say), `T` receives that single type and
+    // only the witnesses tell the alternatives apart, so a copy per witness is possible only
+    // for a single constraint.
+    auto witnessSet = witnessSets[0];
+    if (!unionType)
     {
-        Dictionary<IRInst*, IRWitnessTable*> witnesses;
-        HashSet<IRInst*> concreteTypes;
-        for (UInt i = 0; i < set->getCount(); ++i)
-        {
-            auto witness = as<IRWitnessTable>(set->getElement(i));
-            if (!witness)
-                return nullptr;
-            auto type = witness->getConcreteType();
-            if (witnesses.containsKey(type))
-                return nullptr;
-            witnesses.add(type, witness);
-            concreteTypes.add(type);
-        }
-        if (builder.getSet(kIROp_TypeSet, concreteTypes) != unionType->getSet())
+        if (witnessSets.getCount() != 1)
             return nullptr;
-        witnessesByType.add(witnesses);
+        for (UInt i = 0; i < witnessSet->getCount(); ++i)
+        {
+            auto witness = as<IRWitnessTable>(witnessSet->getElement(i));
+            if (!witness || witness->getConcreteType() != typeArg)
+                return nullptr;
+        }
+    }
+    List<Dictionary<IRInst*, IRWitnessTable*>> witnessesByType;
+    if (unionType)
+    {
+        for (auto set : witnessSets)
+        {
+            Dictionary<IRInst*, IRWitnessTable*> witnesses;
+            HashSet<IRInst*> concreteTypes;
+            for (UInt i = 0; i < set->getCount(); ++i)
+            {
+                auto witness = as<IRWitnessTable>(set->getElement(i));
+                if (!witness)
+                    return nullptr;
+                auto type = witness->getConcreteType();
+                if (witnesses.containsKey(type))
+                    return nullptr;
+                witnesses.add(type, witness);
+                concreteTypes.add(type);
+            }
+            if (builder.getSet(kIROp_TypeSet, concreteTypes) != unionType->getSet())
+                return nullptr;
+            witnessesByType.add(witnesses);
+        }
     }
 
-    auto witnessSet = witnessSets[0];
     Dictionary<IRInst*, std::pair<IRInst*, IRFuncType*>> mapping;
     auto tagCount = UInt(witnessSets.getCount());
     for (UInt i = 0; i < witnessSet->getCount(); ++i)
@@ -4154,8 +4173,13 @@ static IRFunc* trySpecializePerConformance(
         for (UInt j = 0; j < specializeInst->getArgCount(); ++j)
             args.add(specializeInst->getArg(j));
         args[typeArgIndex] = concreteType;
-        for (Index j = 0; j < witnessSets.getCount(); ++j)
-            args[witnessArgIndices[j]] = witnessesByType[j].getValue(concreteType);
+        if (unionType)
+        {
+            for (Index j = 0; j < witnessSets.getCount(); ++j)
+                args[witnessArgIndices[j]] = witnessesByType[j].getValue(concreteType);
+        }
+        else
+            args[witnessArgIndices[0]] = witness;
         // In combine<A>(), both the function and its type must use A and its witnesses.
         // The incoming specialization still has the dynamic signature, so specialize the
         // generic's type with the same arguments before constructing the concrete function

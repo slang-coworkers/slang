@@ -4,7 +4,7 @@
 //DIAGNOSTIC_TEST:SIMPLE(diag=METHOD_ARG):-target hlsl -entry computeMain -DCASE=3 -conformance A:IValue=3 -conformance B:IValue=7
 //DIAGNOSTIC_TEST:SIMPLE(diag=EXPLICIT):-target hlsl -entry computeMain -DCASE=4 -conformance A:IValue=3 -conformance B:IValue=7
 //DIAGNOSTIC_TEST:SIMPLE(diag=TWO_CALLS):-target hlsl -entry computeMain -DCASE=5 -conformance A:IValue=3 -conformance B:IValue=7
-//DIAGNOSTIC_TEST:SIMPLE(diag=MERGED):-target hlsl -entry computeMain -DCASE=6 -conformance A:IValue=3 -conformance B:IValue=7 -conformance Number<0>:ICode=0 -conformance Number<1>:ICode=1
+//DIAGNOSTIC_TEST:SIMPLE(diag=MERGED):-target hlsl -entry computeMain -DCASE=6 -conformance A:IValue=3 -conformance B:IValue=7 -conformance Number<0>:ICodeScale=0 -conformance Number<1>:ICodeScale=1
 
 // Slang 2025 disallows specializing a generic with an existential. The target
 // parameter of `extension<T : IValue> T` is the exception because its set of types
@@ -16,7 +16,8 @@
 // the method's own parameter receives an existential. EXPLICIT passes an interface type
 // explicitly for that parameter. TWO_CALLS shows that a method that cannot be split is
 // reported once, at the first call. MERGED uses conformers that specialize to one
-// shared struct, so the type set cannot be split per type either.
+// shared struct and a method with two constraints: with a single type left, the
+// witnesses of the two constraints cannot be paired per conformer.
 #lang slang 2025
 
 interface IValue { uint get(); [mutating] void bump(); }
@@ -33,10 +34,16 @@ extension<T : IValue> T
 uint ordinary<T : IValue>(T value) { return value.get(); }
 
 interface ICode { static uint code(); }
-struct Number<let N : uint> : ICode { static uint code() { return N; } }
-extension<T : ICode> T
+interface IScale { static uint scale(); }
+interface ICodeScale : ICode, IScale {}
+struct Number<let N : uint> : ICodeScale
 {
-    uint codeOf() { return T.code(); }
+    static uint code() { return N; }
+    static uint scale() { return N + 1; }
+}
+extension<T : ICode & IScale> T
+{
+    uint codeOf() { return T.code() * T.scale(); }
 }
 
 uint pairWith<V : IValue>(V value, IValue other) { return value.pair(other); }
@@ -74,8 +81,8 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
 //TWO_CALLS:                              ^ specializing 'changingResult' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
     outputBuffer[tid.y] = a.changingResult().get();
 #else
-    outputBuffer[tid.x] = createDynamicObject<ICode>(tid.x, 0u).codeOf();
-//MERGED:                                                             ^ cannot specialize generic with existential type
-//MERGED:                                                             ^ specializing 'codeOf' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
+    outputBuffer[tid.x] = createDynamicObject<ICodeScale>(tid.x, 0u).codeOf();
+//MERGED:                                                                  ^ cannot specialize generic with existential type
+//MERGED:                                                                  ^ specializing 'codeOf' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
 #endif
 }

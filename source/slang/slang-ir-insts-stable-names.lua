@@ -880,7 +880,7 @@ return {
 	["Decoration.postDepthCoverage"] = 903,
 	["Decoration.AutodiffParameterContextTypeDecoration"] = 905,
 	["DebugLexicalBlock"] = 906,
-	["Decoration.SpecializePerConformance"] = 907,
-	["Decoration.ConstrainedTypeDecoration"] = 908,
-	["Decoration.FlattenedGenericDecoration"] = 910
+	["Decoration.SpecializePerConformance"] = 910,
+	["Decoration.ConstrainedTypeDecoration"] = 911,
+	["Decoration.FlattenedGenericDecoration"] = 912
 }
