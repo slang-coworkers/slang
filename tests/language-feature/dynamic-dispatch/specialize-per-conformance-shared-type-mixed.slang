@@ -1,10 +1,10 @@
 //TEST(compute):COMPARE_COMPUTE_EX(filecheck-buffer=CHECK):-cpu -compute -shaderobj -output-using-type
 //TEST(compute):COMPARE_COMPUTE_EX(filecheck-buffer=CHECK):-vk -compute -shaderobj -output-using-type
-//TEST:SIMPLE(filecheck=HLSL):-target hlsl -entry computeMain -conformance Number<0>:ICode=0 -conformance Number<1>:ICode=1 -conformance Number<2>:ICode=2 -DLANG2025
+//TEST:SIMPLE(filecheck=HLSL):-target hlsl -entry computeMain -conformance Number<0>:ICode=0 -conformance Number<1>:ICode=1 -conformance Other:ICode=2 -DLANG2025
 
-// Empty specializations of one generic struct specialize to one shared type, so `T`
-// receives that single type while its witnesses still tell the conformers apart.
-// With one constraint, the method still gets one copy per conformer, keyed by witness.
+// `Number<0>` and `Number<1>` are one IR type (see specialize-per-conformance-shared-type.slang)
+// and `Other` has its own, so `T` receives a set of two types with three witnesses. With one
+// constraint, each witness still gets its own copy of the method.
 #ifdef LANG2025
 #lang slang 2025
 #endif
@@ -19,6 +19,12 @@ struct Number<let N : uint> : ICode
     static uint code() { return N; }
 }
 
+struct Other : ICode
+{
+    uint pad;
+    static uint code() { return 7; }
+}
+
 extension<T : ICode> T
 {
     uint codeOf() { return T.code() * 10; }
@@ -26,7 +32,7 @@ extension<T : ICode> T
 
 //TEST_INPUT: type_conformance Number<0>:ICode = 0
 //TEST_INPUT: type_conformance Number<1>:ICode = 1
-//TEST_INPUT: type_conformance Number<2>:ICode = 2
+//TEST_INPUT: type_conformance Other:ICode = 2
 //TEST_INPUT:ubuffer(data=[0 0 0], stride=4):out,name=outputBuffer
 RWStructuredBuffer<uint> outputBuffer;
 
@@ -39,5 +45,6 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
 
 // CHECK: 0
 // CHECK: 10
-// CHECK: 20
-// HLSL-COUNT-3: uint codeOf_{{[0-9]+}}()
+// CHECK: 70
+// HLSL-COUNT-3: uint codeOf_{{[0-9]+}}(
+// HLSL-NOT: uint codeOf_{{[0-9]+}}(

@@ -4054,24 +4054,24 @@ bool isPerConformanceCandidate(IRSpecialize* specialize)
 // its uses of IA and IB, then runs inside one arm of the dispatcher.
 //
 // Return a dispatcher with the ordinary set-specialization signature, or null.
-// `outMarkedParamHasTypeSet` reports whether the marked `T` received a set of types, so the
-// caller can tell a method whose signature rules out per-type copies apart from an ordinary set
-// specialization. Failed attempts can leave unused concrete specializations for normal
-// dead-code elimination.
+// `outIsPerConformanceSetArg` reports whether the argument for `T` or for one of the witnesses of
+// its constraints is a set, that is, whether this specialization was meant to get per-type copies.
+// The caller uses it to tell a method whose signature rules out per-type copies apart from an
+// ordinary set specialization. Failed attempts can leave unused concrete specializations for
+// normal dead-code elimination.
 static IRFunc* trySpecializePerConformance(
     IRSpecialize* specializeInst,
     IRFuncType* dispatchType,
     SpecializationContext* context,
     UInt specializationDepth,
-    bool& outMarkedParamHasTypeSet)
+    bool& outIsPerConformanceSetArg)
 {
     SLANG_ASSERT(context);
-    outMarkedParamHasTypeSet = false;
+    outIsPerConformanceSetArg = false;
     auto generic = cast<IRGeneric>(specializeInst->getBase());
 
-    // The marked `T` receives a set of types when its own argument or the argument of one of
-    // its witnesses is a set. The type argument alone does not show it: types that specialize
-    // to identical declarations can be merged, leaving one type with several witnesses.
+    // The argument for `T` alone does not show whether this specialization has several
+    // alternatives: conformers can share one IR type (see below) while their witnesses differ.
     IRParam* typeParam = nullptr;
     UInt typeArgIndex = 0;
     UInt argIndex = 0;
@@ -4087,11 +4087,14 @@ static IRFunc* trySpecializePerConformance(
         }
         if (findPerConformanceTypeParam(param) &&
             (as<IRUntaggedUnionType>(arg) || as<IRWitnessTableSet>(arg)))
-            outMarkedParamHasTypeSet = true;
+            outIsPerConformanceSetArg = true;
         ++argIndex;
     }
-    if (!outMarkedParamHasTypeSet)
+    if (!outIsPerConformanceSetArg)
         return nullptr;
+    // A witness parameter refers to `T` through ConstrainedTypeDecoration, and lowering adds that
+    // decoration only for a marked `T` of the same generic.
+    SLANG_ASSERT(typeParam);
     auto typeArg = specializeInst->getArg(typeArgIndex);
     auto unionType = as<IRUntaggedUnionType>(typeArg);
 
@@ -4121,50 +4124,44 @@ static IRFunc* trySpecializePerConformance(
     IRBuilder builder(specializeInst->getModule());
     builder.setInsertInto(specializeInst->getModule());
 
-    // Each alternative of the first witness set gets one copy. Usually `T` receives a set of
-    // distinct types, and the witnesses of each further constraint are paired with that
-    // alternative by their concrete type. When the alternatives specialize to one shared type
-    // (empty specializations of one generic struct, say), `T` receives that single type and
-    // only the witnesses tell the alternatives apart, so a copy per witness is possible only
-    // for a single constraint.
-    auto witnessSet = witnessSets[0];
-    if (!unionType)
-    {
-        if (witnessSets.getCount() != 1)
-            return nullptr;
-        for (UInt i = 0; i < witnessSet->getCount(); ++i)
-        {
-            auto witness = as<IRWitnessTable>(witnessSet->getElement(i));
-            if (!witness || witness->getConcreteType() != typeArg)
-                return nullptr;
-        }
-    }
+    // Each alternative of the first witness set gets one copy, and the witnesses of every further
+    // constraint are paired with it by concrete type. Alternatives usually have distinct concrete
+    // types, but they can share one: removeUnusedGenericParam hoists a struct that does not use
+    // its generic parameters out of its generic, so the empty specializations `Number<0>` and
+    // `Number<1>` of `struct Number<let N : uint> : ICode` are one IR type with two witness
+    // tables. With a single constraint, each of those witnesses still gets its own copy; with
+    // several constraints, a shared type leaves no way to pair the witnesses.
+    //
+    // Typeflow derives the argument for `T` and the witness sets from the same values, so the
+    // witnesses of every constraint cover exactly the types `T` can receive: the alternatives of
+    // a set of types, or the single type that every alternative shares. Any other shape keeps the
+    // shared body.
+    auto expectedTypes =
+        unionType ? unionType->getSet() : builder.getSingletonSet(kIROp_TypeSet, typeArg);
+    auto tagCount = UInt(witnessSets.getCount());
     List<Dictionary<IRInst*, IRWitnessTable*>> witnessesByType;
-    if (unionType)
+    for (auto set : witnessSets)
     {
-        for (auto set : witnessSets)
+        Dictionary<IRInst*, IRWitnessTable*> witnesses;
+        HashSet<IRInst*> concreteTypes;
+        for (UInt i = 0; i < set->getCount(); ++i)
         {
-            Dictionary<IRInst*, IRWitnessTable*> witnesses;
-            HashSet<IRInst*> concreteTypes;
-            for (UInt i = 0; i < set->getCount(); ++i)
-            {
-                auto witness = as<IRWitnessTable>(set->getElement(i));
-                if (!witness)
-                    return nullptr;
-                auto type = witness->getConcreteType();
-                if (witnesses.containsKey(type))
-                    return nullptr;
-                witnesses.add(type, witness);
-                concreteTypes.add(type);
-            }
-            if (builder.getSet(kIROp_TypeSet, concreteTypes) != unionType->getSet())
+            auto witness = as<IRWitnessTable>(set->getElement(i));
+            if (!witness)
                 return nullptr;
-            witnessesByType.add(witnesses);
+            auto type = witness->getConcreteType();
+            if (witnesses.containsKey(type) && tagCount > 1)
+                return nullptr;
+            witnesses[type] = witness;
+            concreteTypes.add(type);
         }
+        if (builder.getSet(kIROp_TypeSet, concreteTypes) != expectedTypes)
+            return nullptr;
+        witnessesByType.add(witnesses);
     }
 
     Dictionary<IRInst*, std::pair<IRInst*, IRFuncType*>> mapping;
-    auto tagCount = UInt(witnessSets.getCount());
+    auto witnessSet = witnessSets[0];
     for (UInt i = 0; i < witnessSet->getCount(); ++i)
     {
         auto witness = cast<IRWitnessTable>(witnessSet->getElement(i));
@@ -4173,13 +4170,9 @@ static IRFunc* trySpecializePerConformance(
         for (UInt j = 0; j < specializeInst->getArgCount(); ++j)
             args.add(specializeInst->getArg(j));
         args[typeArgIndex] = concreteType;
-        if (unionType)
-        {
-            for (Index j = 0; j < witnessSets.getCount(); ++j)
-                args[witnessArgIndices[j]] = witnessesByType[j].getValue(concreteType);
-        }
-        else
-            args[witnessArgIndices[0]] = witness;
+        args[witnessArgIndices[0]] = witness;
+        for (Index j = 1; j < witnessSets.getCount(); ++j)
+            args[witnessArgIndices[j]] = witnessesByType[j].getValue(concreteType);
         // In combine<A>(), both the function and its type must use A and its witnesses.
         // The incoming specialization still has the dynamic signature, so specialize the
         // generic's type with the same arguments before constructing the concrete function
@@ -4387,25 +4380,27 @@ IRInst* specializeGenericWithSetArgs(
 
             // Decide the dispatch boundary before cloning a shared body. The concrete path
             // uses the same tag-parameter ABI, so callers need no special handling.
-            bool markedParamHasTypeSet = false;
+            bool isPerConformanceSetArg = false;
             if (auto dispatcher = trySpecializePerConformance(
                     specializeInst,
                     dispatchType,
                     context,
                     specializationDepth,
-                    markedParamHasTypeSet))
+                    isPerConformanceSetArg))
             {
                 loweredFunc->removeAndDeallocate();
                 return dispatcher;
             }
 
-            // A Slang 2025 module disallows specializing a generic with an existential.
-            // Typeflow admits a marked extension parameter under that rule only because it
-            // is specialized per type, and its specializeCall moves the module's mark onto this
+            // In a Slang 2025 module, addDecorationsForGenericsSpecializedWithExistentials puts
+            // DisallowSpecializationWithExistentialsDecoration on the call's specialization.
+            // Typeflow admits a marked extension parameter under that rule only because it is
+            // specialized per type, and typeflow's specializeCall copies the decoration onto this
             // set specialization; a shape without per-type copies is therefore still an error.
             // We go on to build the shared body so the IR stays well formed until compilation
-            // stops on the error.
-            if (markedParamHasTypeSet && context && context->sink &&
+            // stops on the error. Per-type copies need the specialization context, which every
+            // caller of this function supplies.
+            if (isPerConformanceSetArg && context->sink &&
                 specializeInst
                     ->findDecoration<IRDisallowSpecializationWithExistentialsDecoration>())
                 diagnoseCannotSpecializeGenericWithExistential(

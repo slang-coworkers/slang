@@ -4,7 +4,7 @@
 //DIAGNOSTIC_TEST:SIMPLE(diag=METHOD_ARG):-target hlsl -entry computeMain -DCASE=3 -conformance A:IValue=3 -conformance B:IValue=7
 //DIAGNOSTIC_TEST:SIMPLE(diag=EXPLICIT):-target hlsl -entry computeMain -DCASE=4 -conformance A:IValue=3 -conformance B:IValue=7
 //DIAGNOSTIC_TEST:SIMPLE(diag=TWO_CALLS):-target hlsl -entry computeMain -DCASE=5 -conformance A:IValue=3 -conformance B:IValue=7
-//DIAGNOSTIC_TEST:SIMPLE(diag=MERGED):-target hlsl -entry computeMain -DCASE=6 -conformance A:IValue=3 -conformance B:IValue=7 -conformance Number<0>:ICodeScale=0 -conformance Number<1>:ICodeScale=1
+//DIAGNOSTIC_TEST:SIMPLE(diag=SHARED_TYPE):-target hlsl -entry computeMain -DCASE=6 -conformance A:IValue=3 -conformance B:IValue=7 -conformance Number<0>:ICodeScale=0 -conformance Number<1>:ICodeScale=1
 
 // Slang 2025 disallows specializing a generic with an existential. The target
 // parameter of `extension<T : IValue> T` is the exception because its set of types
@@ -15,9 +15,9 @@
 // METHOD_ARG calls `pair` through a generic wrapper, so its receiver is static and only
 // the method's own parameter receives an existential. EXPLICIT passes an interface type
 // explicitly for that parameter. TWO_CALLS shows that a method that cannot be split is
-// reported once, at the first call. MERGED uses conformers that specialize to one
-// shared struct and a method with two constraints: with a single type left, the
-// witnesses of the two constraints cannot be paired per conformer.
+// reported once, at the first call. SHARED_TYPE uses conformers that are one IR type
+// (empty specializations of one generic struct) and a method with two constraints: with
+// a single type left, the witnesses of the two constraints cannot be paired per conformer.
 #lang slang 2025
 
 interface IValue { uint get(); [mutating] void bump(); }
@@ -82,7 +82,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     outputBuffer[tid.y] = a.changingResult().get();
 #else
     outputBuffer[tid.x] = createDynamicObject<ICodeScale>(tid.x, 0u).codeOf();
-//MERGED:                                                                  ^ cannot specialize generic with existential type
-//MERGED:                                                                  ^ specializing 'codeOf' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
+//SHARED_TYPE:                                                             ^ cannot specialize generic with existential type
+//SHARED_TYPE:                                                             ^ specializing 'codeOf' with an existential type is not allowed. All generic arguments must be statically resolvable at compile time.
 #endif
 }
