@@ -1,12 +1,13 @@
-# Whole-helper specialization prototype
+# Per-conformance specialization of extension methods
 
-The internal `[__specializePerConformance]` attribute requests concrete copies of an
-ordinary generic helper when called with a dynamically selected type. It addresses
-the helper-based requests in [#13268](https://github.com/shader-slang/slang/issues/13268)
-and [#13267](https://github.com/shader-slang/slang/issues/13267), without adding another
-interface, callback requirement, or conformance registration. Its spelling and policy
-remain experimental. It is a general generic-function feature, with no geometry or
-RayQuery-specific implementation.
+A method of a generic extension whose target type is the extension's own type
+parameter, `extension<T : I> T`, behaves like an interface method when it is called
+on a dynamically selected value: the compiler specializes the whole method once per
+concrete type and dispatches to the copy for the runtime type. This addresses the
+helper-based requests in [#13268](https://github.com/shader-slang/slang/issues/13268)
+and [#13267](https://github.com/shader-slang/slang/issues/13267) without another
+interface, callback requirement, conformance registration, or attribute. Nothing in
+the implementation is specific to geometry or RayQuery.
 
 ## Source contract
 
@@ -15,134 +16,113 @@ interface IA { uint a(); }
 interface IB { uint b(); }
 interface IValue : IA, IB {}
 
-[__specializePerConformance]
-uint combine<T : IA & IB>(T value)
+extension<T : IA & IB> T
 {
-    return value.a() * value.b();
+    uint combine() { return this.a() * this.b(); }
 }
 
 // Given existing IValue conformance registrations:
-// combine(createDynamicObject<IValue>(typeID, payload));
+// createDynamicObject<IValue>(typeID, payload).combine();
 ```
 
-The compiler selects a concrete copy of the entire helper. Both interface calls and
-their surrounding computation stay together. Multiple constraints on the same type
-do not require a Cartesian product of independent choices. Additional generic
-arguments may be static, including a traversal handler and its query-state type.
+Each concrete copy of `combine` contains both interface calls and the computation
+around them. Multiple constraints on `T` do not multiply the number of copies. The
+method may have its own generic parameters, such as a traversal handler type or
+`let Flags : uint` for `RayQuery<Flags>`, as long as their arguments are static.
 
-This supports `void` and fixed concrete results such as `bool`, `float`, and concrete
-structs. A result is fixed when the ordinary and every concrete function signature
-have the identical result type; no new result conversion is introduced. Concrete
-`out` and `inout` parameters are forwarded unchanged. A direct by-value dynamic
-payload uses the existing dispatcher marshalling.
+Per-type copies apply in every language mode. Slang 2025 otherwise rejects
+specializing a generic with an existential (E33180); a method of such an extension
+is the exception when its copies can be formed.
 
-The current implementation requires one dynamic type represented by typeflow as an
-untagged union, with finite witness sets whose witnesses uniquely identify its
-concrete alternatives. Each witness parameter must explicitly constrain that same
-generic type parameter. Type-changing results, type-changing references, nested
-payload conversions, independent dynamic type arguments, and parameter-pack arity
-changes are unsupported. Some partially specialized generic type representations
-also fall outside this contract and are diagnosed rather than structurally guessed.
+A method gets per-type copies when its signature is the same for every concrete
+type, apart from a by-value `this` or `T` payload: `void` or fixed results such as
+`bool`, `float` and concrete structs, and concrete `out`/`inout` parameters. The
+following shapes keep the shared body that ordinary set specialization builds (and
+are still E33180 in Slang 2025):
 
-## Diagnostics and resource policy
+- results or references whose type depends on `T`, such as a method returning `T`
+  or a `[mutating]` method;
+- nested payloads such as `Foo<T>`, and parameter packs whose expansion changes the
+  signature;
+- a second dynamic type, for example a method generic parameter that receives
+  another existential;
+- witnesses for constraints on something other than `T`.
 
-An unsupported marked dynamic specialization emits warning
-`specialize-per-conformance-not-applied` (55219), explaining the reason, and retains
-ordinary specialization. Suppress it explicitly when fallback is acceptable, or
-make the request mandatory with:
+In Slang 2025 the error for such a method is reported once, at the first call
+that reaches its shared set specialization.
 
-```text
--warnings-as-errors specialize-per-conformance-not-applied
-```
-
-Static calls continue to specialize normally. Combining the attribute with
-`[__unsafeForceInlineEarly]` produces the same warning because early inlining removes
-the boundary on which the request operates. Ordinary `[ForceInline]` is compatible.
-
-The experiment retains resource limits of eight concrete copies and 1,024 original
-block-child instructions multiplied by copy count. These are provisional compiler
-resource safeguards, not measured profitability thresholds or promises of final
-native code size. Exceeding either limit now produces a diagnostic. They do not
-bound transitive callees, aggregate copies across helpers, downstream inlining, or
-register allocation. Existing recursive-specialization depth protection remains
-separate. Public spelling, configurable budgets, and whether a supported version
-should diagnose failure as an error by default remain maintainer decisions.
-
-The requested compiler transformation does not guarantee final driver instruction
-placement or faster execution. Unknown conformance IDs retain the existing
-`createDynamicObject` contract; this feature does not define a new one.
+The compiler does not guarantee final driver instruction placement or faster
+execution. Unknown conformance IDs keep the existing `createDynamicObject` contract.
 
 ## Representation and compiler boundary
 
-`emitGenericConstraintValue` already knows the checked subtype of each constraint.
-It now records a `ConstrainedTypeDecoration` on direct generic witness parameters.
-For `T : IA & IB`, both witness parameters point to the same T parameter. Interface
-`This` witness parameters carry the corresponding relation too. This preserves
-semantic information at its producer: equal possible-type sets or matching interface
-names alone cannot prove that witnesses constrain the same parameter.
+`emitGenericDecl` (`slang-lower-to-ir.cpp`) marks the IR parameter for `T` with
+`SpecializePerConformanceDecoration` when the generic's inner declaration is an
+`ExtensionDecl` whose target type is that parameter. `emitGenericConstraintValue`
+records a `ConstrainedTypeDecoration` naming `T` on each witness parameter for a
+constraint on that marked `T`. For `T : IA & IB`, both witness parameters point to
+`T`; equal possible-type sets or matching interface names alone cannot prove that.
 
-`analyzeSpecialize` supplies typeflow's canonical type and witness sets.
-`specializeGenericWithSetArgs` builds the ordinary signature with one leading tag
-per witness set. Before cloning a shared helper body, it attempts the requested
-whole-helper specialization and diagnoses any unsupported shape.
+A method with its own generic parameters lowers to a generic nested in the
+extension's generic, so a call is `specialize(specialize(g, T', w'), N)`. When the
+outer arguments bind the marked `T` dynamically in code outside a generic, the
+specialization pass rewrites the call to `specialize(flattened(g), T', w', N)`, so
+typeflow and the dispatcher see a generic that returns a function.
+`flattenNestedGeneric` builds the flattened generic, which records `g` in a
+`FlattenedGenericDecoration`. The flattened generic is only the dynamic call's
+shape: each per-type copy is specialized through the nested form
+`specialize(specialize(g, A, wA), N)`, and a specialization of the flattened
+generic whose arguments all become static is rewritten back to that form. A copy
+for `A` is therefore the same function a static call `a.method<N>()` produces, so
+the method is not duplicated and its `static` variables are not split. Because
+compiler-dictionary values are weak, the pass keeps the intermediate generic
+`specialize(g, A, wA)` alive until it finishes, since the per-type copies are made
+in a later round than the static calls.
 
-`trySpecializeHelperPerConformance` verifies the constrained-type relation, then
-indexes each witness set by `getConcreteType()`. Every set must cover exactly the
-canonical union alternatives, with one witness per type. It uses these keys to
-specialize the original generic with the matching witnesses through
-`specializeGeneric`. No witness-entry positions, numeric-tag equality, structural
-equivalence relation, or new substitution algorithm are used.
+Typeflow (`analyzeSpecialize`) supplies the set of types for `T` and a witness set
+per constraint. `specializeGenericWithSetArgs` builds the ordinary signature with
+one leading tag per witness set, then first calls
+`trySpecializeHelperPerConformance`. That function requires every other argument
+to be a single static value, indexes each witness set by `getConcreteType()`, and
+checks that every set covers exactly the alternatives of the type set, with one
+witness per type. It specializes the generic and its type once per type through
+`specializeGeneric` and checks each resulting signature against the dispatcher.
+No witness-entry positions, numeric-tag equality, structural equivalence relation,
+or new substitution algorithm are used.
 
 `createDispatchFunc` accepts the count of leading witness tags (one by default).
-For this caller they all describe the same concrete T, so only the first selects a
+For this caller they all describe the same concrete `T`, so only the first selects a
 branch. The remaining tags preserve the ordinary caller ABI but are not passed to
-the concrete body. Existing callers retain their one-tag behavior. Existing
-`emitWitnessTableWrapper` handles direct by-value payloads and fixed returns;
-identical concrete references pass through without additional temporaries.
+the concrete body. Existing `emitWitnessTableWrapper` handles direct by-value
+payloads and fixed returns; identical concrete references pass through without
+additional temporaries.
 
-This is valid existing dynamic IR, not malformed data being patched downstream.
-The producer-side metadata supplies a relationship needed to safely handle multiple
-constraints. The feature changes the specialization boundary; it does not move
-individual query reads across `Proceed`, commits, or other state mutations.
+In Slang 2025, `addDecorationsForGenericsSpecializedWithExistentials` still marks
+the call's specialization. Typeflow's `isInvalidExistentialSpecialization` accepts
+a specialization whose dynamic arguments bind only the marked `T` and its witnesses
+(`isPerConformanceSpecialization`), and `specializeCall` moves the mark, with the
+call's location, to the set specialization. If `trySpecializeHelperPerConformance`
+cannot form the copies for a marked set specialization,
+`specializeGenericWithSetArgs` reports E33180.
 
 ## Relationship to #13245
 
 The associated-result regression constructs and consumes a concrete associated
-result within the helper, avoiding an intermediate `AnyValue` in emitted HLSL.
-That is distinct from returning a dynamically changing result across the helper
+result within the method, avoiding an intermediate `AnyValue` in emitted HLSL.
+That is distinct from returning a dynamically changing result across the method
 boundary. Tag-namespace unification, arbitrary caller-tail duplication, and removal
 of all existential conversions remain separate work.
 
-## Validation
+## Tests
 
-The review fixes were validated on 2026-10-06 after merging master `e6be8dcdd`,
-using Windows Release tools. The dynamic-dispatch, interface, generic, and focused
-diagnostic suites passed 892/892 tests, with 452 unsupported/excluded checks skipped.
-The checked-in regressions now include:
-
-- Warning and warning-as-error checks for both resource limits, unsupported results
-  and references, independent types, early inlining, associated-type witness
-  ownership, and empty/singleton parameter packs. Diagnostic matching is exhaustive.
-- A small helper below the instruction budget and a 600-call helper above it, with
-  three conformers to exercise a copy count that does not divide 1024.
-- D3D12/Vulkan result checks and HLSL/SPIR-V structure checks for the general helpers.
-  CPU directives also cover the main, multiple-constraint, and fixed-result tests.
-
-The local C++ CPU backend is unavailable, so its test directives are skipped here.
-Direct LLVM host execution of those three cases produced the expected output
-buffers without a GPU. This is separate from a passing CPU test-harness run.
-Restoring the removed type-equality assertion makes the empty-pack regression
-abort; the final code instead emits the requested warning and compiles the fallback.
-
-Earlier validation of the broadened implementation included separately compiled
-helper-module imports, 30 compile controls for the original repros, and GPU
-correctness checks for both repros on D3D12/Vulkan (RTX 4090 / driver 591.86), with
-five modes, two independently linked copies, 65,536 rays, and 512 CPU-reference
-rays. These are manual experiments rather than additional checked-in test cases.
-
-Earlier compact timing experiments on `e57a377b3` plus the initial prototype found
-no measurable helper/callback difference. Those are historical measurements, not
-timings of this revision. No speedup is claimed. The matching larger-renderer
-snapshot, scene, and launch command remain unidentified; its native register count,
-native code size, and performance with this feature remain unverified. The
-demonstrated benefit is cleaner source with per-conformer helper specialization.
+- `tests/language-feature/dynamic-dispatch/specialize-per-conformance*.slang`:
+  CPU, Vulkan and D3D12 results plus HLSL, SPIR-V and DXIL structure checks for
+  per-type copies, multiple constraints, fixed results, concrete references,
+  associated results, separately compiled conformers, ray queries (also generic
+  over the query flags) and methods with their own generic parameters.
+- `tests/language-feature/dynamic-dispatch/interface-extension-diagnose.slang`:
+  Slang 2025 accepts the extension method and still rejects an ordinary generic
+  function called with the same existential.
+- `tests/diagnostics/specialize-per-conformance-*.slang`: Slang 2025 keeps E33180
+  for results and references whose type depends on `T` and for parameter packs;
+  legacy mode compiles the shared body.
