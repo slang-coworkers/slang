@@ -9,6 +9,7 @@
 //TEST:SIMPLE(filecheck=CHECK): -target hlsl -stage compute -entry computeMain
 //TEST:SIMPLE(filecheck=CHECK): -target glsl -stage compute -entry computeMain
 //TEST:SIMPLE(filecheck=HLSL): -target hlsl -stage compute -entry computeMain -DEXTENSION_ONLY
+//TEST:SIMPLE(filecheck=CALLS): -target hlsl -stage compute -entry computeMain -DEXTENSION_ONLY
 
 #lang slang 2025
 
@@ -56,8 +57,8 @@ float calcTwice(IInterface obj, float y)
     return obj.calcTwice(y);
 #else
     // Only the ordinary generic function is diagnosed.
-    // CHECK-NOT: specializing 'calcTwice'
     // CHECK: error[E33180]
+    // CHECK-NOT: specializing 'calcTwice'
     // CHECK: specializing 'calcTwiceGeneric' with an existential type
     // CHECK-NOT: error[E33180]
     return obj.calcTwice(y) + calcTwiceGeneric(obj, y);
@@ -77,12 +78,17 @@ void computeMain(uint3 dispatchThreadID : SV_DispatchThreadID)
     outputBuffer[1] = f(1, 3);
 }
 
-// One copy of calcTwice per conforming type, each calling its own type's calc directly
-// rather than through a dispatch function.
-// HLSL: float calcTwice_{{[0-9]+}}(float
-// HLSL-NOT: }
-// HLSL: = {{A|B}}_calc_
-// HLSL: float calcTwice_{{[0-9]+}}(float
-// HLSL-NOT: }
-// HLSL: = {{A|B}}_calc_
+// Two copies of the extension's calcTwice take only `x` (a shared body would also take a tag)
+// and call a type's calc directly, with no dispatch function anywhere in the output. Between
+// them, the calls reach both A's and B's calc.
 // HLSL-NOT: _dispatch_
+// HLSL: float calcTwice_{{[0-9]+}}(float x_{{[0-9]+}})
+// HLSL-NOT: }
+// HLSL: = {{A|B}}_calc_{{[0-9]+}}(x_
+// HLSL-NOT: _dispatch_
+// HLSL: float calcTwice_{{[0-9]+}}(float x_{{[0-9]+}})
+// HLSL-NOT: }
+// HLSL: = {{A|B}}_calc_{{[0-9]+}}(x_
+// HLSL-NOT: _dispatch_
+// CALLS-DAG: = A_calc_{{[0-9]+}}(x_
+// CALLS-DAG: = B_calc_{{[0-9]+}}(x_

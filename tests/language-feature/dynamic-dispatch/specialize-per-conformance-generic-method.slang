@@ -63,11 +63,13 @@ extension<T : IValue> T
 //TEST_INPUT: type_conformance A:IValue = 3
 //TEST_INPUT: type_conformance B:IValue = 7
 //TEST_INPUT:ubuffer(data=[3 7], stride=4):name=ids
-//TEST_INPUT:ubuffer(data=[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0], stride=4):out,name=outputBuffer
+//TEST_INPUT:ubuffer(data=[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0], stride=4):out,name=outputBuffer
 StructuredBuffer<uint> ids;
 RWStructuredBuffer<uint> outputBuffer;
 
-// A call from inside another generic function, specialized again for each type.
+// Calls of the extension's generic methods on a type parameter of another generic function
+// are flattened inside its body. Both via(value) and the static via(a) still reach the copies
+// that direct calls use, so A's counter is shared with them.
 uint via<V : IValue>(V v)
 {
     uint r = 0;
@@ -80,7 +82,7 @@ uint via<V : IValue>(V v)
 void computeMain(uint3 tid : SV_DispatchThreadID)
 {
     let value = createDynamicObject<IValue>(ids[tid.x], 5u);
-    uint offset = tid.x * 9;
+    uint offset = tid.x * 10;
     uint result = 0;
     value.consume(result);
     outputBuffer[offset] = result;
@@ -102,6 +104,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
 #ifndef LANG2025
     outputBuffer[offset + 8] = via(value);
 #endif
+    outputBuffer[offset + 9] = via(a);
 }
 
 // CHECK: 9
@@ -113,6 +116,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
 // CHECK: 3
 // CHECK: 6
 // CHECK: 14
+// CHECK: 11
 // CHECK: 14
 // CHECK: 130
 // CHECK: 21
@@ -122,6 +126,7 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
 // CHECK: 3
 // CHECK: 3
 // CHECK: 16
+// CHECK: 7
 
 // Each copy of `apply` reads the marker and handles the result for one type, while
 // `pair` keeps one body that takes the tags of both dynamic types.

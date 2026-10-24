@@ -1,5 +1,8 @@
 //TEST(compute):COMPARE_COMPUTE_EX(filecheck-buffer=CHECK):-cpu -compute -shaderobj -output-using-type
 //TEST(compute):COMPARE_COMPUTE_EX(filecheck-buffer=CHECK):-vk -compute -shaderobj -output-using-type
+
+// With a single conforming type, typeflow narrows the dynamic receiver to `A`, so the
+// dynamic and static calls reach the same specialization and share its `static` variables.
 interface IValue { uint get(); }
 struct A : IValue { uint value; uint get() { return value; } }
 extension<T : IValue> T
